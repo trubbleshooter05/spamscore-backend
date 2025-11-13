@@ -3,7 +3,7 @@
 # ===========================
 
 import os, re, html
-from typing import List, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -15,6 +15,323 @@ import tldextract
 # Use read-only friendly extractor on Vercel
 _TLDX = tldextract.TLDExtract(cache_dir=None)
 
+import os
+import json
+import hashlib
+from typing import Optional, List, Dict, Set
+from redis import Redis
+
+# ========= Vercel KV / Redis Setup =========
+KV_URL = os.getenv("KV_URL", "")
+redis_client = None
+
+if KV_URL:
+    try:
+        redis_client = Redis.from_url(KV_URL, decode_responses=True)
+    except Exception as e:
+        print(f"Redis connection failed: {e}")
+
+# ========= User Management =========
+def get_user_id_from_email(email: str) -> str:
+    """Generate consistent user ID from email"""
+    return hashlib.sha256(email.lower().encode()).hexdigest()[:16]
+
+def extract_email(sender: str) -> str:
+    """Extract email from 'Name <email@domain.com>' format"""
+    match = re.search(r'<([^>]+)>', sender)
+    if match:
+        return match.group(1).lower().strip()
+    return sender.lower().strip()
+
+def extract_display_name(sender: str) -> Optional[str]:
+    """Extract display name from sender"""
+    match = re.search(r'^([^<]+)<', sender)
+    if match:
+        name = match.group(1).strip().strip('"').strip("'")
+        if name and '@' not in name:
+            return name
+    return None
+
+# ========= Whitelist Functions =========
+def get_whitelist_key(user_id: str, wl_type: str) -> str:
+    """Generate Redis key for whitelist"""
+    return f"whitelist:{user_id}:{wl_type}"
+
+def add_to_whitelist(user_id: str, value: str, wl_type: str = 'email') -> bool:
+    """
+    Add entry to user's whitelist
+    wl_type: 'email', 'domain', or 'sender_name'
+    """
+    if not redis_client:
+        return False
+    
+    try:
+        key = get_whitelist_key(user_id, wl_type)
+        redis_client.sadd(key, value.lower())
+        
+        # Store metadata
+        meta_key = f"{key}:meta:{value.lower()}"
+        redis_client.hset(meta_key, mapping={
+            'added_at': datetime.now(timezone.utc).isoformat(),
+            'type': wl_type,
+            'value': value.lower()
+        })
+        
+        return True
+    except Exception as e:
+        print(f"Failed to add to whitelist: {e}")
+        return False
+
+def remove_from_whitelist(user_id: str, value: str, wl_type: str = 'email') -> bool:
+    """Remove entry from whitelist"""
+    if not redis_client:
+        return False
+    
+    try:
+        key = get_whitelist_key(user_id, wl_type)
+        redis_client.srem(key, value.lower())
+        
+        # Remove metadata
+        meta_key = f"{key}:meta:{value.lower()}"
+        redis_client.delete(meta_key)
+        
+        return True
+    except Exception as e:
+        print(f"Failed to remove from whitelist: {e}")
+        return False
+
+def is_whitelisted(user_id: str, value: str, wl_type: str = 'email') -> bool:
+    """Check if value is whitelisted"""
+    if not redis_client:
+        return False
+    
+    try:
+        key = get_whitelist_key(user_id, wl_type)
+        return redis_client.sismember(key, value.lower())
+    except Exception:
+        return False
+
+def get_whitelist(user_id: str, wl_type: str = 'email') -> Set[str]:
+    """Get all whitelist entries for user"""
+    if not redis_client:
+        return set()
+    
+    try:
+        key = get_whitelist_key(user_id, wl_type)
+        return redis_client.smembers(key)
+    except Exception:
+        return set()
+
+def check_whitelist(user_id: str, sender: str) -> tuple[bool, str]:
+    """
+    Check if sender is whitelisted for this user.
+    Returns (is_whitelisted, reason)
+    """
+    if not redis_client:
+        return False, ""
+    
+    sender_email = extract_email(sender)
+    sender_domain = _domain_of(sender_email)
+    sender_name = extract_display_name(sender)
+    
+    # Check exact email match
+    if is_whitelisted(user_id, sender_email, 'email'):
+        return True, f"whitelisted_email:{sender_email}"
+    
+    # Check domain match
+    if is_whitelisted(user_id, sender_domain, 'domain'):
+        return True, f"whitelisted_domain:{sender_domain}"
+    
+    # Check sender name match
+    if sender_name and is_whitelisted(user_id, sender_name.lower(), 'sender_name'):
+        return True, f"whitelisted_sender_name:{sender_name}"
+    
+    return False, ""
+
+# ========= Feedback Recording =========
+def record_feedback(user_id: str, sender: str, subject: str, original_score: int, 
+                    original_verdict: str, user_verdict: str, feedback_type: str):
+    """Record user feedback for training"""
+    if not redis_client:
+        return
+    
+    try:
+        # Create unique feedback ID
+        content_hash = hashlib.sha256(f"{sender}{subject}".encode()).hexdigest()[:16]
+        feedback_key = f"feedback:{user_id}:{content_hash}"
+        
+        redis_client.hset(feedback_key, mapping={
+            'sender': sender,
+            'subject': subject,
+            'original_score': original_score,
+            'original_verdict': original_verdict,
+            'user_verdict': user_verdict,
+            'feedback_type': feedback_type,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+        
+        # Set expiry (keep for 1 year)
+        redis_client.expire(feedback_key, 31536000)
+        
+        # Add to user's feedback list
+        user_feedback_key = f"user_feedback:{user_id}"
+        redis_client.lpush(user_feedback_key, feedback_key)
+        redis_client.ltrim(user_feedback_key, 0, 999)  # Keep last 1000
+        
+    except Exception as e:
+        print(f"Failed to record feedback: {e}")
+
+# ========= Scan History (Optional) =========
+def record_scan(user_id: str, sender: str, subject: str, score: int, 
+                verdict: str, category: str, whitelisted: bool):
+    """Record scan for analytics"""
+    if not redis_client:
+        return
+    
+    try:
+        scan_id = hashlib.sha256(f"{user_id}{sender}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
+        scan_key = f"scan:{user_id}:{scan_id}"
+        
+        redis_client.hset(scan_key, mapping={
+            'sender': sender,
+            'subject': subject,
+            'score': score,
+            'verdict': verdict,
+            'category': category,
+            'whitelisted': int(whitelisted),
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+        
+        # Set expiry (keep for 90 days)
+        redis_client.expire(scan_key, 7776000)
+        
+        # Increment user scan count
+        monthly_key = f"user_scans:{user_id}:{datetime.now().strftime('%Y-%m')}"
+        redis_client.incr(monthly_key)
+        redis_client.expire(monthly_key, 2678400)  # 31 days
+        
+    except Exception as e:
+        print(f"Failed to record scan: {e}")
+
+def get_monthly_scan_count(user_id: str) -> int:
+    """Get user's scan count for current month"""
+    if not redis_client:
+        return 0
+    
+    try:
+        monthly_key = f"user_scans:{user_id}:{datetime.now().strftime('%Y-%m')}"
+        count = redis_client.get(monthly_key)
+        return int(count) if count else 0
+    except Exception:
+        return 0
+
+# ========= Feedback Processing =========
+def process_feedback_command(user_id: str, command: str, original_sender: str, 
+                             original_subject: str, original_score: int, 
+                             original_verdict: str) -> str:
+    """
+    Process user feedback commands
+    Returns confirmation message
+    """
+    command = command.strip().upper()
+    
+    if command == "SAFE":
+        # Mark as false positive, add to whitelist
+        sender_email = extract_email(original_sender)
+        add_to_whitelist(user_id, sender_email, 'email')
+        record_feedback(user_id, original_sender, original_subject, 
+                       original_score, original_verdict, 'safe', 'SAFE')
+        return f"✅ Added {sender_email} to your whitelist. Future emails from this sender will be marked as safe."
+    
+    elif command == "SPAM":
+        # Mark as false negative
+        record_feedback(user_id, original_sender, original_subject, 
+                       original_score, original_verdict, 'spam', 'SPAM')
+        return "✅ Thanks for the feedback! We'll use this to improve spam detection."
+    
+    elif command.startswith("TRUST "):
+        target = command.replace("TRUST ", "").strip()
+        
+        if target.startswith("@"):
+            # Domain whitelist
+            domain = target[1:].lower()
+            add_to_whitelist(user_id, domain, 'domain')
+            return f"✅ Whitelisted domain: {domain}\nAll emails from @{domain} will be marked as safe."
+        else:
+            # Email whitelist
+            email = target.lower()
+            add_to_whitelist(user_id, email, 'email')
+            return f"✅ Whitelisted email: {email}\nFuture emails from this address will be marked as safe."
+    
+    elif command.startswith("UNTRUST "):
+        target = command.replace("UNTRUST ", "").strip()
+        
+        if target.startswith("@"):
+            domain = target[1:].lower()
+            remove_from_whitelist(user_id, domain, 'domain')
+            return f"✅ Removed domain from whitelist: {domain}"
+        else:
+            email = target.lower()
+            remove_from_whitelist(user_id, email, 'email')
+            return f"✅ Removed email from whitelist: {email}"
+    
+    elif command == "LIST":
+        # Show whitelist
+        emails = get_whitelist(user_id, 'email')
+        domains = get_whitelist(user_id, 'domain')
+        
+        msg = "📋 Your Whitelist:\n\n"
+        if emails:
+            msg += "Emails:\n" + "\n".join(f"  • {e}" for e in sorted(emails)) + "\n\n"
+        if domains:
+            msg += "Domains:\n" + "\n".join(f"  • @{d}" for d in sorted(domains)) + "\n\n"
+        if not emails and not domains:
+            msg += "Your whitelist is empty.\n\n"
+        
+        msg += "Reply with 'HELP' for available commands."
+        return msg
+    
+    elif command == "HELP":
+        return """
+📖 SpamScore Commands:
+
+SAFE - Mark email as safe, add sender to whitelist
+SPAM - Report as missed spam (false negative)
+TRUST sender@example.com - Whitelist specific email
+TRUST @company.com - Whitelist entire domain
+UNTRUST sender@example.com - Remove from whitelist
+LIST - Show your whitelist
+HELP - Show this help message
+
+Simply reply to any SpamScore report with one of these commands.
+        """.strip()
+    
+    else:
+        return "❓ Unknown command. Reply with 'HELP' for available commands."
+
+# ========= Update get_simple_explanation =========
+# Add this to your existing explanations dictionary:
+def get_simple_explanation(reason_key: str, context: Dict = None) -> str:
+    context = context or {}
+    explanations = {
+        # ... existing explanations ...
+        
+        # Whitelist explanations
+        "whitelisted_email": "✅ Sender email is on your trusted whitelist",
+        "whitelisted_domain": "✅ Sender domain is on your trusted whitelist", 
+        "whitelisted_sender_name": "✅ Sender name is on your trusted whitelist",
+        "whitelisted_score_reduced": "ℹ️ Score reduced because sender is whitelisted",
+    }
+    
+    base = explanations.get(reason_key.split(":")[0], f"Flagged: {reason_key}")
+    
+    # Add context for whitelisted items
+    if ":" in reason_key and reason_key.startswith("whitelisted"):
+        parts = reason_key.split(":", 1)
+        if len(parts) > 1:
+            base += f" ({parts[1]})"
+    
+    return base
 app = FastAPI()
 
 # ========= Pydantic Models =========
@@ -512,13 +829,22 @@ def get_action_advice(verdict: str, category: str) -> Dict:
     return advice_map.get((verdict, category), default)
 
 # ========= MAIN CATEGORIZATION ENGINE =========
-async def categorize_email(sender: str, subject: str, body: str) -> Dict:
+async def categorize_email(sender: str, subject: str, body: str, user_id: Optional[str] = None) -> Dict:
     """
     Main analysis engine - returns spam score and categorization
     """
     score = 0
     reasons = []
     flags = {}
+    
+    # NEW: Check whitelist first
+    is_wl = False
+    wl_reason = ""
+    if user_id:
+        is_wl, wl_reason = check_whitelist(user_id, sender)
+        if is_wl:
+            flags["whitelisted"] = True
+            flags["whitelist_reason"] = wl_reason
     
     # Extract features
     sender_dom = _domain_of(sender)
@@ -631,6 +957,16 @@ async def categorize_email(sender: str, subject: str, body: str) -> Dict:
             score += 12
             reasons.append(f"reply_to_mismatch:{reply_to}")
     
+    # NEW: Apply whitelist adjustment BEFORE verdict determination
+    if is_wl:
+        original_score = score
+        # Reduce score by 50 points, but don't go negative
+        score = max(0, score - 50)
+        if score != original_score:
+            reasons.append(f"whitelisted_score_reduced:{original_score}->{score}")
+            # Put whitelist reason first in the list
+            reasons.insert(0, wl_reason)
+    
     # Determine verdict and category
     if score >= MIN_BLOCK_SCORE:
         verdict = "block"
@@ -672,7 +1008,8 @@ async def categorize_email(sender: str, subject: str, body: str) -> Dict:
         "simple_reasons": simple_reasons,
         "flags": flags,
         "urls_found": urls,
-        "shortener_urls": shortener_urls if shortener_urls else []
+        "shortener_urls": shortener_urls if shortener_urls else [],
+        "whitelisted": is_wl  # NEW: Add whitelist status
     }
 
 # ========= Mailgun Integration =========
@@ -971,12 +1308,58 @@ async def receive_email(request: Request):
         ""
     )
 
+    # NEW: Generate user ID from sender email
+    user_email = extract_email(sender)
+    user_id = get_user_id_from_email(user_email)
+    
+    # NEW: Check if this is a reply to a SpamScore report (feedback)
+    is_reply = subject.lower().startswith("re:") and "spamscore" in subject.lower()
+    
+    if is_reply:
+        # This is user feedback - process command
+        command = body.split("\n")[0].strip()  # First line is usually the reply
+        
+        # Try to extract original sender from previous email in thread
+        original_sender_feedback = detect_forwarded_original_sender(body) or ""
+        original_subject = ""  # Could extract from body if needed
+        
+        # Process feedback command
+        response_msg = process_feedback_command(
+            user_id, command, original_sender_feedback, original_subject, 0, ""
+        )
+        
+        # Send confirmation email
+        await send_report_via_mailgun(
+            sender,
+            "✅ SpamScore Command Processed",
+            f"<html><body><pre>{response_msg}</pre></body></html>",
+            response_msg
+        )
+        
+        return {
+            "status": "feedback_processed",
+            "user_id": user_id,
+            "command": command,
+            "response": response_msg
+        }
+
+    # Normal spam analysis flow
     # Forwarded original sender (if enabled)
     original_sender = detect_forwarded_original_sender(body) if FORWARDED_PREFER_ORIGINAL else None
     evaluated_sender = original_sender if original_sender else sender
 
-    # Analyze
-    result = await categorize_email(evaluated_sender, subject, body)
+    # NEW: Analyze with user context
+    result = await categorize_email(evaluated_sender, subject, body, user_id=user_id)
+
+    # NEW: Record scan history
+    record_scan(user_id, evaluated_sender, subject, result["score"], 
+                result["verdict"], result["category"], result.get("whitelisted", False))
+    
+    # NEW: Check rate limit
+    scan_count = get_monthly_scan_count(user_id)
+    if scan_count > 100:  # Free tier limit
+        # Still process but add note
+        result["note"] = "Monthly limit exceeded. Upgrade for more scans."
 
     # Build reports
     html_report = build_html_report(sender, subject, result, original_sender, evaluated_sender)
@@ -997,4 +1380,8 @@ async def receive_email(request: Request):
         "mailgun_response": txt[:1000],
         "original_sender": original_sender or "",
         "evaluated_sender": evaluated_sender or sender,
+        "score": result["score"],  # NEW
+        "whitelisted": result.get("whitelisted", False),  # NEW
+        "user_id": user_id,  # NEW
+        "monthly_scans": scan_count + 1,  # NEW
     }
