@@ -1,5 +1,5 @@
 # ===========================
-# api/index.py — AGGRESSIVE VERSION (Fixed False Negatives)
+# api/index.py — V2.5 (FULL FILE: Tightened Logic + Dashboard APIs + Full Reports)
 # ===========================
 
 import os, re, html, math
@@ -425,6 +425,7 @@ def get_simple_explanation(reason_key: str, context: Dict = None) -> str:
         "marketing_language": "📧 Contains typical marketing/promotional language",
         "business_spam": "💼 Appears to be unsolicited business outreach (B2B spam)",
         "free_email_cold_outreach": "🎣 Cold outreach from a free email provider (High Risk)",
+        "free_email_business_content": "🚨 Business/Sales content from a free email address (High Likelihood Spam)",
         "free_email_with_unsubscribe": "🚨 Free email sender using mass-mailing unsubscribe links",
         "poor_grammar": "📝 Contains grammatical errors common in scams",
         "tracking_urls_detected": "📊 Contains tracking links that monitor your clicks",
@@ -457,7 +458,11 @@ def get_simple_explanation(reason_key: str, context: Dict = None) -> str:
         "whitelisted_score_reduced": "ℹ️ Score reduced because sender is whitelisted",
         "blocked_email": "🚫 Sender email is on your blocklist",
         "blocked_domain": "🚫 Sender domain is on your blocklist",
-        "malicious_url_detected": "⛔ DANGER: Contains a confirmed malicious URL (Google Safe Browsing)"
+        "malicious_url_detected": "⛔ DANGER: Contains a confirmed malicious URL (Google Safe Browsing)",
+        "forwarded_unsubscribe_header": "📧 Detected unsubscribe header in forwarded email (Marketing)",
+        "marketing_unsubscribe_link_in_body": "📧 Found 'unsubscribe' link in email body",
+        "high_link_density": "🔗 Unusually high number of links for the email length",
+        "bayesian_spam_content": "🤖 Content analysis indicates spam patterns",
     }
     
     base = explanations.get(reason_key.split(":")[0], f"Flagged: {reason_key}")
@@ -481,11 +486,10 @@ GIT_SHA = os.environ.get("VERCEL_GIT_COMMIT_SHA", "local")
 BUILD_TIME = os.environ.get("BUILD_TIME", datetime.now(timezone.utc).isoformat())
 VERCEL_URL = os.environ.get("VERCEL_URL", "")
 
-# ========= Tunables (NUCLEAR MODE - Block Everything Suspicious) =========
-MIN_BLOCK_SCORE = int(os.getenv("MIN_BLOCK_SCORE", "15"))  # NUCLEAR: Lowered to 15
+# ========= Tunables (TIGHTENED MODE) =========
+MIN_BLOCK_SCORE = int(os.getenv("MIN_BLOCK_SCORE", "15")) # Default to 15 (Strict)
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.00"))
-STRICT_BAD_TLD = True # Enforce strict TLD checking
-
+STRICT_BAD_TLD = True
 
 ENABLE_URL_EXPANSION = os.getenv("ENABLE_URL_EXPANSION", "1") == "1"
 ENABLE_TIPS = os.getenv("ENABLE_TIPS", "1") == "1"
@@ -526,6 +530,9 @@ BUSINESS_SPAM_WEIGHTS = {
     r"\bb2b outreach\b": 15,
     r"\brevops\b|\bsalesops\b": 15,
     r"\bscale your (team|revenue|sales)\b": 15,
+    r"\bwhite label\b": 15,
+    r"\boffshore team\b": 15,
+    r"\boutsourcing\b": 15,
 
     # Medium-confidence (could be legit, but often spam)
     r"\bhir(e|ing) (developers?|engineers?|designers?)\b": 10,
@@ -535,7 +542,9 @@ BUSINESS_SPAM_WEIGHTS = {
     r"\boutsourc(e|ing)\b": 10,
     r"\bfractional (cto|cmo|cfo)\b": 10,
     r"\bbook(ing)? a (call|demo)\b": 10,
-
+    r"\bseo ranking\b": 10,
+    r"\bfirst page of google\b": 10,
+    r"\bweb development\b": 10,
 
     # Lower-confidence (often legit, but can be spammy)
     r"\breach(ing)? out\b": 5,
@@ -545,6 +554,8 @@ BUSINESS_SPAM_WEIGHTS = {
     r"\baudit of your\b": 5,
     r"\bcalendar link\b": 5,
     r"\btalent\s+ready\b": 5,
+    r"\bcollaboration\b": 5,
+    r"\bpartnership\b": 5,
 }
 
 POOR_GRAMMAR_INDICATORS = [
@@ -567,17 +578,13 @@ FREE_EMAIL_SENDERS = {
     "gmail.com","yahoo.com","outlook.com","hotmail.com","icloud.com","aol.com"
 }
 
-# Trusted domains that should get score bonuses (reduce false positives)
+# Trusted domains - Reduced list to avoid false negatives on compromised accounts
 TRUSTED_DOMAINS = {
     "salesforce.com", "sonicwall.com", "microsoft.com", "google.com",
-    "amazon.com", "apple.com", "adobe.com", "dropbox.com", "slack.com",
-    "github.com", "gitlab.com", "atlassian.com", "zoom.us", "teams.microsoft.com",
-    "linkedin.com", "twitter.com", "facebook.com", "instagram.com",
-    "paypal.com", "stripe.com", "square.com", "shopify.com",
-    "netflix.com", "spotify.com", "youtube.com", "twitch.tv",
-    "airbnb.com", "uber.com", "lyft.com", "doordash.com",
-    "bankofamerica.com", "chase.com", "wellsfargo.com", "citi.com",
-    "nasa.gov", "gov.uk", "edu",  # Government and education domains
+    "amazon.com", "apple.com", "stripe.com", "shopify.com",
+    "github.com", "atlassian.com", "zoom.us", "slack.com",
+    "linkedin.com", "paypal.com", "bankofamerica.com", "chase.com",
+    "nasa.gov", "gov.uk", "edu"
 }
 
 URL_SHORTENERS = {
@@ -609,20 +616,31 @@ def _is_all_caps(s: str) -> bool:
 def detect_forwarded_original_sender(body: str) -> str | None:
     if not body:
         return None
+        
+    # CLEANUP: text often comes with * markers or extra spaces in forwards
+    clean_body = body.replace("*", "").strip()
+    
     patterns = [
-        r'From:\s*(?:"[^"]*"\s*)?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?',
+        # Standard Forward: "From: Name <email@domain.com>" (Handle quoted and unquoted names)
+        r'From:.*?\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
+        
+        # "Sender: email@domain.com"
         r'Sender:\s*<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?',
-        r'Begin forwarded message:.*?From:.*?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?',
-        r'[-]+\s*Forwarded message\s*[-]+.*?From:.*?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?',
-        r'(?:forwarded|fwd).*?from:\s*(?:[^<\s]+\s*)?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?',
+        
+        # "Begin forwarded message: ... From: ..."
+        r'Begin forwarded message:.*?From:.*?\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
+        
+        # "Forwarded message ... From: ..."
+        r'Forwarded message.*?From:.*?\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
     ]
+    
     for pattern in patterns:
-        match = re.search(pattern, body, re.IGNORECASE | re.DOTALL)
+        # Use DOTALL so . matches newlines
+        match = re.search(pattern, clean_body, re.IGNORECASE | re.DOTALL)
         if match:
             email = match.group(1).lower().strip()
-            # Allow all email addresses, including no-reply
+            # Validate it looks like an email and ignore the user's own email if caught by accident
             if email and '@' in email:
-                print(f"   🔍 Found potential sender: {email}")
                 return email
     return None
 
@@ -670,7 +688,7 @@ def analyze_email_headers(body: str) -> List[Tuple[str, int]]:
     return contributions
 
 
-def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
+def detect_marketing_email(body: str, subject: str, sender: str = "") -> List[Tuple[str, int]]:
     """
     AGGRESSIVE marketing/promotional email detection
     """
@@ -680,12 +698,18 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
     body_lower = body.lower()
     
     # List-Unsubscribe header = DEFINITIVE marketing email
-    # NUCLEAR: ANY mention of unsubscribe
-    if 'unsubscribe' in combined:  # Check subject + body
-        contributions.append(("marketing_unsubscribe_detected", 50))  # NUCLEAR: 40 → 50
+    # Also checks for "List-Unsubscribe" text in the BODY (for forwards)
+    if 'list-unsubscribe:' in body_lower:
+        contributions.append(("forwarded_unsubscribe_header", 40))
     
-    # Precedence: bulk header = DEFINITIVE bulk/marketing email
-    # Check multiple formats for forwarded emails
+    # FIX: Check for footer links common in forwarded newsletters
+    # Even if the header is gone, the body text usually remains.
+    if "unsubscribe" in body_lower:
+        # Check for context to avoid false positives on normal emails discussing "unsubscribe"
+        if any(x in body_lower for x in ["click here to", "preferences", "opt-out", "browser", "subscription", "manage your"]):
+            contributions.append(("marketing_unsubscribe_link_in_body", 40))
+    
+    # Precedence: bulk header
     if (re.search(r'precedence\s*:\s*bulk', body_lower, re.I) or 
         re.search(r'precedence\s*bulk', body_lower, re.I)):
         contributions.append(("precedence_bulk_header", 20))
@@ -715,9 +739,9 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
     ]
     urgency_count = sum(1 for p in urgency_marketing if re.search(p, combined, re.I))
     if urgency_count >= 2:
-        contributions.append((f"marketing_urgency:{urgency_count}_tactics", 35))  # Increased from 25 to 35
+        contributions.append((f"marketing_urgency:{urgency_count}_tactics", 35))
     elif urgency_count == 1:
-        contributions.append(("marketing_urgency:1_tactic", 15))  # Increased from 10 to 15
+        contributions.append(("marketing_urgency:1_tactic", 15))
     
     # Shop/Buy commands
     if re.search(r'(shop|buy|order|get it)\s+now', combined, re.I):
@@ -725,11 +749,11 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
     
     # Email has BOTH unsubscribe AND urgency/discount = confirmed marketing spam
     if 'unsubscribe' in combined and (urgency_count > 0 or discount_count > 0):
-        contributions.append(("confirmed_marketing_spam", 60))  # NUCLEAR: 40 → 60
+        contributions.append(("confirmed_marketing_spam", 50))
 
-    # NUCLEAR: Urgent subject line detection
+    # Urgent subject line detection
     if re.search(r'\[.*!\]|TODAY|NOW|URGENT|LIMITED|LAST CHANCE', subject, re.I):
-        contributions.append(("urgent_subject_markers", 30))  # NUCLEAR: New detection
+        contributions.append(("urgent_subject_markers", 30))
     
     # Newsletter-specific patterns
     if re.search(r'view (in|this email in) (your )?browser', combined, re.I):
@@ -747,8 +771,7 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
     if re.search(r'(manage|update) (your )?(email )?(preferences|subscription)', combined, re.I):
         contributions.append(("marketing_preferences_link", 12))
     
-    # Marketing platform detection (ClickFunnels, HubSpot, Mailchimp, etc.)
-    # NUCLEAR MODE: Check sender, subject, AND body
+    # Marketing platform detection (EXPANDED - includes e-commerce platforms)
     marketing_platforms = [
         ('clickfunnels', 'clickfunnelsnotifications.com', 'myclickfunnels.com'),
         ('hubspot', 'hubspotlinks.com', 'hs-email.net'),
@@ -760,40 +783,29 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
         ('drip', 'drip.com', 'getdrip.com'),
         ('aweber', 'aweber.com'),
         ('infusionsoft', 'infusionsoft.com', 'keap.com'),
+        ('shopify', 'email.shopify.com', 'shopifyemail.com', 'shopify.com'),
+        ('klaviyo', 'klaviyo.com', 'klaviyomail.com'),
+        ('omnisend', 'omnisend.com'),
+        ('brevo', 'brevo.com', 'sendinblue.com'),
+        ('getresponse', 'getresponse.com'),
+        ('mailerlite', 'mailerlite.com'),
+        ('moosend', 'moosend.com'),
+        ('benchmark', 'benchmarkemail.com'),
     ]
 
-    platform_detected = False
-    sender_combined = f"{sender} {subject} {body}".lower()  # NUCLEAR: Check everything
+    sender_combined = f"{sender} {subject} {body}".lower()
     for platform_keywords in marketing_platforms:
         if any(keyword in sender_combined for keyword in platform_keywords):
             platform_name = platform_keywords[0]
-            contributions.append((f"marketing_platform:{platform_name}", 50))  # NUCLEAR: 25 → 50
-            platform_detected = True
+            contributions.append((f"marketing_platform:{platform_name}", 30))
             break
     
-    # Multiple long tracking URLs (marketing email pattern)
+    # Multiple long tracking URLs
     tracking_url_count = len(re.findall(r'https?://[^\s<>()"\']{50,}', body))
     if tracking_url_count >= 3:
-        contributions.append(("multiple_tracking_urls", 25))  # Increased from 20 to 25
+        contributions.append(("multiple_tracking_urls", 25))
     elif tracking_url_count >= 1:
-        contributions.append(("tracking_url_present", 12))  # New: Even 1 tracking URL is suspicious
-    
-    # Forwarded marketing emails - check subject for "Fwd:" + marketing keywords
-    if re.search(r'^fwd?:\s*', subject.lower()) and (
-        'launch' in combined or 'price' in combined or 'tutorial' in combined or
-        'discount' in combined or 'sale' in combined or 'offer' in combined
-    ):
-        contributions.append(("forwarded_marketing_email", 25))
-    
-    # Marketing content patterns in forwarded emails
-    marketing_keywords = [
-        r'\blaunch(es|ed|ing)\b', r'\bprice(s|d)?\s*(reduction|lower|down)\b',
-        r'\btutorial(s)?\b', r'\bnew\s+(product|feature|update)\b',
-        r'\bdeploy\s+(now|immediately)\b', r'\bview\s+pricing\b'
-    ]
-    marketing_content_matches = sum(1 for pattern in marketing_keywords if re.search(pattern, combined, re.I))
-    if marketing_content_matches >= 2:
-        contributions.append(("marketing_content_patterns", 20))
+        contributions.append(("tracking_url_present", 12))
     
     return contributions
 
@@ -878,7 +890,7 @@ def check_sender_name_email_mismatch(sender: str, body: str) -> List[Tuple[str, 
     
     return contributions
 
-# ========= Bayesian Scoring (for False Negatives) =========
+# ========= Bayesian Scoring (EXPANDED VOCAB) =========
 SPAM_VOCAB = {
     "free": 10, "win": 8, "winner": 5, "prize": 7, "claim": 6, "urgent": 9,
     "limited": 8, "offer": 10, "deal": 7, "subscribe": 5, "unsubscribe": 10,
@@ -886,7 +898,14 @@ SPAM_VOCAB = {
     "crypto": 6, "investment": 7, "guaranteed": 8, "million": 5, "dollars": 5,
     "cash": 7, "credit": 6, "loan": 6, "now": 10, "risk-free": 7, "congratulations": 7,
     "selected": 6, "special": 8, "promotion": 8, "seo": 8, "marketing": 7,
-    "growth": 7, "generate": 7, "leads": 8, "revenue": 6
+    "growth": 7, "generate": 7, "leads": 8, "revenue": 6, "traffic": 7,
+    "ranking": 7, "outsource": 9, "offshore": 9, "development": 6, "hiring": 6,
+    "dedicated": 5, "team": 5, "proposal": 6, "partnership": 6, "collaboration": 5,
+    "opt-out": 8, "remove": 5, "list": 5, "database": 6, "verify": 7, "account": 5,
+    "suspended": 8, "locked": 8, "action": 7, "required": 6, "immediately": 7,
+    "bonus": 8, "exclusive": 7, "opportunity": 6, "passive": 7, "income": 7,
+    "calendar": 6, "meeting": 5, "call": 5, "zoom": 5, "demo": 6, "audit": 6,
+    "complimentary": 7, "gift": 7, "vouchers": 7, "rates": 5, "quota": 6,
 }
 
 HAM_VOCAB = {
@@ -904,19 +923,17 @@ def calculate_bayesian_score(text: str) -> float:
     total_spam_words = sum(SPAM_VOCAB.values())
     total_ham_words = sum(HAM_VOCAB.values())
     
-    # Prior probabilities (assume equal for simplicity)
+    # Prior probabilities
     p_spam = 0.5
     p_ham = 0.5
 
-    # Use log probabilities to avoid underflow
     log_spam_prob = math.log(p_spam)
     log_ham_prob = math.log(p_ham)
 
-    # Vocabulary of all known words
     vocab = set(SPAM_VOCAB.keys()) | set(HAM_VOCAB.keys())
     
     for word in text_words:
-        if len(word) > 2 and len(word) < 20: # ignore very short and very long words
+        if len(word) > 2 and len(word) < 20:
             # Calculate P(word | Spam) with Laplace smoothing
             p_word_spam = (SPAM_VOCAB.get(word, 0) + 1) / (total_spam_words + len(vocab))
             log_spam_prob += math.log(p_word_spam)
@@ -926,15 +943,15 @@ def calculate_bayesian_score(text: str) -> float:
             log_ham_prob += math.log(p_word_ham)
 
     # Return a score based on the difference.
-    # The multiplication factor can be tuned.
     score = (log_spam_prob - log_ham_prob) * 3.0
     
-    # Cap the score to prevent it from dominating everything else.
-    if score > 0:
-        return min(score, 30.0)
-    else:
-        # Give a smaller negative score to avoid incorrectly classifying ham as super safe
-        return max(score, -10.0)
+    # Cap negative score (Ham) so it doesn't override strong spam signals
+    # Max deduction is now -5 points (previously -10)
+    if score < 0:
+        return max(score, -5.0)
+    
+    # Cap positive score (Spam)
+    return min(score, 35.0)
 
 # ========= URL Analysis =========
 def _url_features(urls: List[str]) -> Tuple[bool, bool, bool, List[str]]:
@@ -1051,6 +1068,16 @@ def get_action_advice(verdict: str, category: str) -> Dict:
                 "These emails clutter your inbox with no value"
             ]
         },
+        ("block", "marketing"): {
+            "emoji": "🗑️",
+            "title": "BLOCK THIS EMAIL - Promotional",
+            "subtitle": "Aggressive marketing detected",
+            "steps": [
+                "Delete or move to spam folder",
+                "Unsubscribe if you don't remember signing up",
+                "These emails clutter your inbox with no value"
+            ]
+        },
         ("block", "suspicious"): {
             "emoji": "⚠️",
             "title": "BLOCK THIS EMAIL - Suspicious Content",
@@ -1111,23 +1138,13 @@ def get_action_advice(verdict: str, category: str) -> Dict:
     
     return advice_map.get((verdict, category), default)
 
-# ========= MAIN CATEGORIZATION ENGINE (BALANCED MODE - False Positive Fixes) =========
+# ========= MAIN CATEGORIZATION ENGINE =========
 async def categorize_email(sender: str, subject: str, body: str, user_id: Optional[str] = None) -> Dict:
     """
     Main analysis engine - returns spam score and categorization
-    
-    CHANGES MADE TO REDUCE FALSE POSITIVES:
-    1. Fixed undefined 'flags' variable bug (would cause runtime error)
-    2. Added trusted domain bonuses (-25 points) to reduce false positives
-    3. Increased MIN_BLOCK_SCORE from 40 to 50 (higher threshold before blocking)
-    4. Made business spam detection less aggressive (only flag with high confidence or free email)
-    5. Reduced marketing penalties for trusted domains (30-50% reduction)
-    6. Improved whitelist effectiveness (up to 40 point reduction)
-    7. Increased caution threshold from 15 to 20 points
-    8. Skip Bayesian scoring for trusted domains (they get benefit of the doubt)
     """
     contributions = []
-    flags = {}  # FIX: Initialize flags dictionary early to prevent NameError
+    flags = {}
     
     # Check whitelist first
     is_wl = False
@@ -1177,25 +1194,22 @@ async def categorize_email(sender: str, subject: str, body: str, user_id: Option
     combined = f"{subject_lower} {body_lower}"
     urls = extract_urls(body)
     
-    # CHANGE: Trusted domain bonus (reduces false positives)
-    # Legitimate companies (Microsoft, Google, banks, etc.) get -25 point bonus
-    # This prevents false positives from trusted senders
-    # FIX: We'll apply this bonus AFTER calculating spam signals to prevent spam from scoring 0
+    # Trusted domain bonus check
     is_trusted_domain = False
     for trusted in TRUSTED_DOMAINS:
         if trusted in sender_dom:
             is_trusted_domain = True
-            # Don't add bonus here - we'll apply it conditionally later
             break
     
-    # CHANGE: Bayesian score (only apply if not from trusted domain)
-    # Trusted domains get benefit of the doubt - skip Bayesian spam detection
+    # 1. Bayesian Score (Skip for trusted domains)
     if not is_trusted_domain:
         bayesian_score = calculate_bayesian_score(combined)
-        if bayesian_score != 0:
-            contributions.append(("bayesian_score", bayesian_score))
+        if bayesian_score > 5: # Only add if significant spam signal
+            contributions.append(("bayesian_spam_content", bayesian_score))
+        elif bayesian_score < -2: # Weak bonus for ham
+            contributions.append(("bayesian_ham_bonus", bayesian_score))
     
-    # URL Analysis
+    # 2. URL Analysis
     tracking_hit, bad_tld_hit, long_query_hit, shortener_urls = _url_features(urls)
     
     # Google Safe Browsing check
@@ -1204,6 +1218,12 @@ async def categorize_email(sender: str, subject: str, body: str, user_id: Option
         contributions.append(("malicious_url_detected", 100))
         flags["malicious_urls"] = malicious_urls
     
+    # 3. Link Density Check (New)
+    # If short email (<100 words) has >3 links -> Spam
+    word_count = len(re.findall(r'\w+', body_lower))
+    if word_count < 100 and len(urls) > 3:
+        contributions.append(("high_link_density", 15))
+
     # Header-based detection for forwarded emails
     header_contributions = analyze_email_headers(body)
     if header_contributions:
@@ -1226,50 +1246,38 @@ async def categorize_email(sender: str, subject: str, body: str, user_id: Option
     elif phishing_matches == 1:
         contributions.append(("potential_phishing_language", 15))
     
-    # CHANGE: Business spam indicators (less aggressive to reduce false positives)
-    # OLD: Would flag any business spam with score >= 10
-    # NEW: Only flag if very high confidence (>=20) OR medium confidence (>=10) from free email
+    # Business spam indicators
     biz_score = 0
     for pattern, weight in BUSINESS_SPAM_WEIGHTS.items():
         if re.search(pattern, combined, re.I):
             biz_score += weight
     
-    # Only flag business spam if:
-    # 1. Very high confidence (biz_score >= 20) - multiple strong signals, OR
-    # 2. Medium confidence (biz_score >= 10) AND from free email AND not trusted domain
-    # This prevents legitimate business emails from corporate domains being flagged
     is_free_email = sender_dom in FREE_EMAIL_SENDERS
-    if biz_score >= 20:  # Very high confidence - flag regardless of sender
+    if biz_score >= 20:
         contributions.append(("business_spam", biz_score))
         if is_free_email:
             contributions.append(("free_email_cold_outreach_kicker", 15))
     elif biz_score >= 10 and is_free_email and not is_trusted_domain:
-        # Medium confidence but from free email (not trusted) - likely spam
         contributions.append(("business_spam", biz_score))
         contributions.append(("free_email_cold_outreach_kicker", 10))
+        
+    # Free Email + Business Content = High Risk
+    if is_free_email and biz_score > 0:
+        contributions.append(("free_email_business_content", 20))
     
-    # CHANGE: Marketing/junk indicators (reduced penalties for trusted domains)
-    # OLD: Same penalty regardless of sender
-    # NEW: Trusted domains get 33-47% penalty reduction (legitimate marketing is OK)
+    # Marketing/junk indicators
     junk_matches = sum(1 for j in JUNK_WORDS if re.search(j, combined, re.I))
     if junk_matches >= 3:
-        # Heavy marketing: 30 → 20 points for trusted domains (33% reduction)
         penalty = 20 if is_trusted_domain else 30
         contributions.append(("heavy_marketing_language", penalty))
     elif junk_matches >= 2:
-        # Regular marketing: 15 → 8 points for trusted domains (47% reduction)
         penalty = 8 if is_trusted_domain else 15
         contributions.append(("marketing_language", penalty))
     
-    # CHANGE: Marketing Email Detection (skip for trusted domains)
-    # Trusted domains can send marketing emails - don't penalize them
-    # CRITICAL: Use full body (body_for_detection) which includes headers
-    if not is_trusted_domain:
-        marketing_contributions = detect_marketing_email(body, subject)
-        if marketing_contributions:
-            # Don't reduce marketing penalties - they should be applied fully
-            # The 30% reduction was causing marketing emails to score too low
-            contributions.extend(marketing_contributions)
+    # Marketing Email Detection (Always run to catch forwarded stuff)
+    marketing_contributions = detect_marketing_email(body, subject, sender)
+    if marketing_contributions:
+        contributions.extend(marketing_contributions)
     
     # Poor grammar indicators
     grammar_matches = sum(1 for g in POOR_GRAMMAR_INDICATORS if re.search(g, combined, re.I))
@@ -1290,16 +1298,13 @@ async def categorize_email(sender: str, subject: str, body: str, user_id: Option
     if _is_all_caps(subject):
         contributions.append(("all_caps_subject", 10))
     if re.search(r"re:|fwd:", subject_lower) and not re.search(r"re:|fwd:", body_lower[:200]):
-        contributions.append(("fake_reply_subject", 5))
+        contributions.append(("fake_reply_subject", 10)) # Increased from 5
     
     # Urgency/pressure tactics
     if re.search(r"\burgent\b|\basap\b|\bimmediate\b|\bnow\b.*action", combined, re.I):
         contributions.append(("urgency_pressure", 15))
     
-    # CHANGE: Generic greetings (reduced penalty for trusted domains)
-    # OLD: 10 points for all generic greetings
-    # NEW: 5 points for trusted domains, 10 for others
-    # Legitimate companies often use "Dear Customer" in mass emails
+    # Generic greetings
     if re.search(r"dear (customer|user|client|member|sir|madam)\b", combined, re.I):
         penalty = 5 if is_trusted_domain else 10
         contributions.append(("generic_greeting", penalty))
@@ -1311,97 +1316,60 @@ async def categorize_email(sender: str, subject: str, body: str, user_id: Option
         if _domain_of(reply_to) != sender_dom:
             contributions.append((f"reply_to_mismatch:{reply_to}", 12))
     
-    # Calculate final score from all contributions
+    # Calculate final score
     score = sum(c[1] for c in contributions)
     
-    # CRITICAL FIX: Ensure minimum score for detected spam signals
-    # If we detected ANY spam signals (positive contributions), score should be at least 10
-    # This prevents spam from scoring 0 when bonuses cancel out signals
-    # Exclude bonuses and whitelist reductions from this check
-    spam_contributions = [c for c in contributions if c[1] > 0 and 
-                         not c[0].startswith("trusted_domain") and 
-                         not c[0].startswith("whitelisted") and
-                         not c[0].startswith("minimum")]
-    has_spam_signals = len(spam_contributions) > 0
-    if has_spam_signals and score < 10:
-        score = 10  # Minimum score for any email with spam signals
-        contributions.append(("minimum_spam_score_enforced", 0))
+    # Check for any spam signals (ignoring bonuses)
+    spam_signals = [c for c in contributions if c[1] > 0]
+    has_spam_signal = len(spam_signals) > 0
     
-    # FIX: Apply trusted domain bonus AFTER calculating spam signals
-    # CRITICAL FIX: Only apply bonus for low scores (< 20) to prevent spam from scoring 0
-    # If a trusted domain has strong spam signals (score >= 20), don't apply bonus
-    # This prevents spam from trusted domains (e.g., compromised accounts) from being hidden
-    # The bonus helps reduce false positives for borderline cases but doesn't hide real spam
+    # Disable Trusted Domain Bonus if spam signals exist
     if is_trusted_domain:
-        if score < 20:  # Only apply bonus for low scores (borderline cases)
-            # Apply bonus: reduce score by up to 10 points, but never below 10
-            # Example: score 15 -> bonus 5 -> final 10 (still detectable)
-            # Example: score 25 -> no bonus (spam signals too strong)
-            bonus = min(10, max(0, score - 10))  # Bonus up to 10, but keep at least 10 points
-            if bonus > 0:
-                score = max(10, score - bonus)  # Ensure minimum of 10
-                contributions.append(("trusted_domain_bonus", -bonus))
-            elif score < 10:
-                # Very low score (< 10) - set to 10 minimum (still detectable as suspicious)
-                score = 10
-                contributions.append(("trusted_domain_bonus_minimum", 0))
-        else:
-            # Score >= 20 from trusted domain - strong spam signals, don't apply bonus
-            contributions.append(("trusted_domain_bonus_ignored_high_risk", 0))
+        if has_spam_signal:
+            contributions.append(("trusted_domain_bonus_disabled_by_content", 0))
+        elif score < 10:
+            score = max(0, score - 10)
+            contributions.append(("trusted_domain_bonus", -10))
     
-    # Ensure score doesn't go negative
     score = max(0, score)
     
-    # CHANGE: Apply whitelist adjustment (more effective reduction)
-    # OLD: Complex calculation that didn't work well
-    # NEW: Simple reduction of up to 40 points for whitelisted senders
+    # Whitelist adjustment
     if is_wl:
         original_score = score
-        # SAFETY CHECK: Don't reduce score if it's VERY high (>70) - might be real threat
-        # Even whitelisted senders can be compromised, so don't ignore high-risk signals
         if score < 70:
-            # Reduce score significantly for whitelisted senders (up to 40 points)
-            score_reduction = min(score, 40)  # Cap reduction at 40 points
+            score_reduction = min(score, 40)
             score = max(0, score - score_reduction)
             contributions.append((wl_reason, -score_reduction))
         else:
             contributions.append((f"{wl_reason} (IGNORED: High Risk Content)", 0))
     
-    # AGGRESSIVE MODE: Determine verdict and category (optimized to catch more spam)
-    # MIN_BLOCK_SCORE is 35 (lowered from 50 to catch marketing spam)
-    # Caution threshold is 20
-    # Marketing detection scores increased by 30-50% to reduce false negatives
-    # CRITICAL FIX: Check for marketing signals even at low scores
-    has_marketing_signals = any("marketing" in c[0].lower() or "unsubscribe" in c[0].lower() or 
+    # Verdict Logic
+    # Tightened: Any Marketing/Business Spam triggers Caution immediately
+    has_marketing = any("marketing" in c[0].lower() or "unsubscribe" in c[0].lower() or 
                                 "precedence" in c[0].lower() or "hubspot" in c[0].lower() or
-                                "tracking" in c[0].lower() for c in contributions if c[1] > 0)
+                                "tracking" in c[0].lower() or "platform" in c[0].lower() for c in contributions if c[1] > 0)
+    has_biz = any("business" in c[0] for c in spam_signals)
     
-    if score >= MIN_BLOCK_SCORE:  # MIN_BLOCK_SCORE is 35 (AGGRESSIVE MODE)
+    if score >= MIN_BLOCK_SCORE:
         verdict = "block"
         if phishing_matches >= 1 or has_malicious:
             category = "phishing"
         elif biz_score >= 20 or (biz_score >= 10 and is_free_email):
             category = "business_spam"
-        elif junk_matches >= 2:  # Lowered from 3 to 2 (more aggressive)
+        elif junk_matches >= 2:
             category = "junk"
-        elif has_marketing_signals:  # Added: Marketing emails should be blocked
+        elif has_marketing:
             category = "marketing"
         else:
             category = "suspicious"
-    elif score >= 15 or has_marketing_signals:  # Lowered from 20 to 15 (catch more marketing)
+    elif score >= 10 or has_marketing or has_biz:
         verdict = "caution"
-        if has_marketing_signals or junk_matches >= 1:
-            category = "marketing"
-        else:
-            category = "suspicious"
+        category = "marketing" if has_marketing else "suspicious"
     else:
         verdict = "safe"
         category = "legitimate"
     
-    # Build simplified reasons for user display
     simple_reasons = [{"explanation": get_simple_explanation(r), "severity": "high" if c > 15 else "medium" if c > 5 else "low"} for r, c in contributions if c > 0]
-    
-    # Detailed reasons with scores
     detailed_reasons = [{"explanation": get_simple_explanation(r), "points": c} for r, c in contributions if c != 0]
     
     return {
@@ -1413,12 +1381,12 @@ async def categorize_email(sender: str, subject: str, body: str, user_id: Option
         "simple_reasons": simple_reasons,
         "detailed_reasons": detailed_reasons,
         "flags": {
-            **flags,  # Includes whitelisted, malicious_urls, etc.
+            **flags,
             "tracking_hit": tracking_hit,
             "bad_tld_hit": bad_tld_hit,
             "long_query_hit": long_query_hit,
             "link_count": len(urls),
-            "is_trusted_domain": is_trusted_domain,  # NEW: Track if sender is trusted
+            "is_trusted_domain": is_trusted_domain,
         },
         "urls_found": urls,
         "shortener_urls": shortener_urls if shortener_urls else [],
@@ -1645,7 +1613,7 @@ async def root():
     return {
         "status": "ok",
         "service": "SpamScore Backend",
-        "version": "2.2-balanced-fp-fixed",
+        "version": "2.5-tightened-full",
         "git_sha": GIT_SHA[:8] if GIT_SHA else "unknown",
         "build_time": BUILD_TIME,
         "endpoints": {
@@ -1670,43 +1638,15 @@ async def receive_mailgun_webhook(
     """
     Main webhook for receiving emails from Mailgun
     """
-    # FIX: Deduplication - prevent processing same email twice
-    # Create a unique hash of the email content
-    email_hash = hashlib.sha256(f"{sender}{subject}{body_plain or body_html or ''}".encode()).hexdigest()[:16]
-    dedup_key = f"email_processed:{email_hash}"
-    
-    # NUCLEAR MODE: Duplicate detection DISABLED for testing
-    # Check if we've already processed this email in the last 5 minutes
-    if False:  # Disabled - was: if redis_client:
-        try:
-            if redis_client.exists(dedup_key):
-                print(f"   ⚠️ Duplicate email detected (hash: {email_hash}), skipping...")
-                return {
-                    "status": "duplicate",
-                    "message": "This email was already processed recently",
-                    "email_hash": email_hash
-                }
-            # Mark as processed for 5 minutes
-            redis_client.setex(dedup_key, 300, "1")  # 5 minutes TTL
-        except Exception as e:
-            print(f"   ⚠️ Deduplication check failed: {e}")
-
-    print(f"   📧 Processing email (hash: {email_hash}, duplicate check: DISABLED)")
-    
     # Extract user email from the forwarder
     user_email = sender.lower().strip()
     user_id = get_user_id_from_email(user_email)
     
-    # Bodies
-    body_plain_text = body_plain or ""
-    body_html_text = body_html or ""
-    stripped = stripped_text or ""
-    
-    # Use FULL body for detection
-    body_for_detection = body_plain_text or body_html_text or stripped
-    
-    # Use stripped_text for normal processing (cleaner)
-    body = stripped or body_plain_text or body_html_text
+    # CRITICAL FIX: Use FULL body content for forwarded emails (stripped_text removes original content!)
+    body_for_detection = body_plain or body_html or stripped_text
+
+    # Prioritize HTML for Content Scanning (hidden links/pixels)
+    body_for_scanning = body_html or body_plain or stripped_text
     
     print(f"\n{'='*60}")
     print(f"📧 RECEIVED EMAIL FROM: {sender}")
@@ -1715,24 +1655,19 @@ async def receive_mailgun_webhook(
     # Try to detect original sender in forwarded email
     original_sender = detect_forwarded_original_sender(body_for_detection) if FORWARDED_PREFER_ORIGINAL else None
     
-    # 🔴 HEURISTIC FORWARD DETECTION (Regex Fallback)
-    # If regex fails but it looks like a forward, assume unknown sender to disable whitelist.
-    is_forwarded_structure = "forwarded message" in body_for_detection.lower() or "from:" in body_for_detection.lower()[:500]
+    # Heuristic fallback
+    is_forwarded_structure = "forwarded message" in body_for_detection.lower() or "from:" in body_for_detection.lower()[:1000]
     
     if original_sender:
         evaluated_sender = original_sender
-        # It is definitely a forward, so we do NOT use the forwarder's whitelist/blocklist
-        # because we are analyzing the stranger, not the user.
         analysis_user_id = None 
         print(f"   ✅ Extracted Original Sender: {evaluated_sender}")
         
     elif is_forwarded_structure and FORWARDED_PREFER_ORIGINAL:
         # We see it's a forward, but regex failed. 
-        # We treat this as "Unknown Sender" and DISCARD the User ID for whitelist checks.
-        # This prevents the user's own whitelist from zeroing out the spam score.
         evaluated_sender = "unknown_potential_spam@unknown.com"
         analysis_user_id = None
-        print(f"   ⚠️ Detected forward structure but couldn't parse sender. Disabling whitelist for strict scan.")
+        print(f"   ⚠️ Detected forward structure but couldn't parse sender. Disabling whitelist.")
         
     else:
         # Direct email
@@ -1743,10 +1678,9 @@ async def receive_mailgun_webhook(
     # Generate unique scan ID
     scan_id = hashlib.sha256(f"{user_id}{evaluated_sender}{subject}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
     
-    # Analyze with appropriate context
-    # Note: If analysis_user_id is None, it skips whitelist checks (GOOD for forwards)
-    # CRITICAL: Use body_for_detection (includes headers) for marketing detection, not stripped body
-    result = await categorize_email(evaluated_sender, subject, body_for_detection, user_id=analysis_user_id)
+    # Analyze
+    # Pass body_for_scanning (HTML included) so we detect hidden links/pixels
+    result = await categorize_email(evaluated_sender, subject, body_for_scanning, user_id=analysis_user_id)
     
     print(f"   📊 Final Score: {result['score']} ({result['verdict']})")
     
