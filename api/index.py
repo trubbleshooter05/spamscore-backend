@@ -1675,8 +1675,9 @@ async def receive_mailgun_webhook(
     email_hash = hashlib.sha256(f"{sender}{subject}{body_plain or body_html or ''}".encode()).hexdigest()[:16]
     dedup_key = f"email_processed:{email_hash}"
     
+    # NUCLEAR MODE: Duplicate detection DISABLED for testing
     # Check if we've already processed this email in the last 5 minutes
-    if redis_client:
+    if False:  # Disabled - was: if redis_client:
         try:
             if redis_client.exists(dedup_key):
                 print(f"   ⚠️ Duplicate email detected (hash: {email_hash}), skipping...")
@@ -1689,6 +1690,8 @@ async def receive_mailgun_webhook(
             redis_client.setex(dedup_key, 300, "1")  # 5 minutes TTL
         except Exception as e:
             print(f"   ⚠️ Deduplication check failed: {e}")
+
+    print(f"   📧 Processing email (hash: {email_hash}, duplicate check: DISABLED)")
     
     # Extract user email from the forwarder
     user_email = sender.lower().strip()
