@@ -481,8 +481,8 @@ GIT_SHA = os.environ.get("VERCEL_GIT_COMMIT_SHA", "local")
 BUILD_TIME = os.environ.get("BUILD_TIME", datetime.now(timezone.utc).isoformat())
 VERCEL_URL = os.environ.get("VERCEL_URL", "")
 
-# ========= Tunables (AGGRESSIVE MODE - Catch More Spam) =========
-MIN_BLOCK_SCORE = int(os.getenv("MIN_BLOCK_SCORE", "35"))  # Lowered from 50 to catch marketing spam
+# ========= Tunables (NUCLEAR MODE - Block Everything Suspicious) =========
+MIN_BLOCK_SCORE = int(os.getenv("MIN_BLOCK_SCORE", "15"))  # NUCLEAR: Lowered to 15
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.00"))
 STRICT_BAD_TLD = True # Enforce strict TLD checking
 
@@ -680,11 +680,9 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
     body_lower = body.lower()
     
     # List-Unsubscribe header = DEFINITIVE marketing email
-    # Check multiple formats for forwarded emails and header variations
-    if (re.search(r'list-unsubscribe\s*:', body_lower, re.I) or
-        re.search(r'list-unsubscribe-post\s*:', body_lower, re.I) or
-        'list-unsubscribe' in body_lower):  # Also check without colon for forwarded emails
-        contributions.append(("marketing_unsubscribe_header", 40))  # Increased from 35 to 40
+    # NUCLEAR: ANY mention of unsubscribe
+    if 'unsubscribe' in combined:  # Check subject + body
+        contributions.append(("marketing_unsubscribe_detected", 50))  # NUCLEAR: 40 → 50
     
     # Precedence: bulk header = DEFINITIVE bulk/marketing email
     # Check multiple formats for forwarded emails
@@ -727,7 +725,11 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
     
     # Email has BOTH unsubscribe AND urgency/discount = confirmed marketing spam
     if 'unsubscribe' in combined and (urgency_count > 0 or discount_count > 0):
-        contributions.append(("confirmed_marketing_spam", 40))  # Increased from 30 to 40
+        contributions.append(("confirmed_marketing_spam", 60))  # NUCLEAR: 40 → 60
+
+    # NUCLEAR: Urgent subject line detection
+    if re.search(r'\[.*!\]|TODAY|NOW|URGENT|LIMITED|LAST CHANCE', subject, re.I):
+        contributions.append(("urgent_subject_markers", 30))  # NUCLEAR: New detection
     
     # Newsletter-specific patterns
     if re.search(r'view (in|this email in) (your )?browser', combined, re.I):
@@ -746,6 +748,7 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
         contributions.append(("marketing_preferences_link", 12))
     
     # Marketing platform detection (ClickFunnels, HubSpot, Mailchimp, etc.)
+    # NUCLEAR MODE: Check sender, subject, AND body
     marketing_platforms = [
         ('clickfunnels', 'clickfunnelsnotifications.com', 'myclickfunnels.com'),
         ('hubspot', 'hubspotlinks.com', 'hs-email.net'),
@@ -760,10 +763,11 @@ def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
     ]
 
     platform_detected = False
+    sender_combined = f"{sender} {subject} {body}".lower()  # NUCLEAR: Check everything
     for platform_keywords in marketing_platforms:
-        if any(keyword in body_lower for keyword in platform_keywords):
+        if any(keyword in sender_combined for keyword in platform_keywords):
             platform_name = platform_keywords[0]
-            contributions.append((f"marketing_platform:{platform_name}", 25))  # Increased from 15 to 25
+            contributions.append((f"marketing_platform:{platform_name}", 50))  # NUCLEAR: 25 → 50
             platform_detected = True
             break
     
