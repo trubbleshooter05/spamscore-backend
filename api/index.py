@@ -1,26 +1,33 @@
 # ===========================
-# api/index.py — V2.5 (FULL FILE: Tightened Logic + Dashboard APIs + Full Reports)
+# api/index.py — V3.2 (Restored Missing Function + Fixed Forward Reading)
 # ===========================
 
-import os, re, html, math
-from typing import Dict, List, Optional, Tuple, Set
+import os
+import re
+import html
+import math
+import json
+import hashlib
+import socket
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from typing import Dict, List, Optional, Tuple, Set
 
 from fastapi import FastAPI, Query, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import tldextract
+from redis import Redis
+
+# ==============================================================================
+# CONFIGURATION & SETUP
+# ==============================================================================
 
 # Use read-only friendly extractor on Vercel
 _TLDX = tldextract.TLDExtract(cache_dir=None)
 
-import json
-import hashlib
-from redis import Redis
-
-# ========= INITIALIZE FASTAPI APP (CRITICAL!) =========
+# Initialize FastAPI
 app = FastAPI()
 
 # Enable CORS for dashboard
@@ -29,14 +36,14 @@ app.add_middleware(
     allow_origins=[
         "https://spamscore-dashboard.vercel.app",
         "http://localhost:3000",
-        "http://localhost:3001"
+        "http://localhost:3001",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ========= Vercel KV / Redis Setup =========
+# Vercel KV / Redis Setup
 KV_URL = os.getenv("KV_URL", "")
 redis_client = None
 
@@ -46,851 +53,123 @@ if KV_URL:
     except Exception as e:
         print(f"Redis connection failed: {e}")
 
-# ========= User Management =========
-def get_user_id_from_email(email: str) -> str:
-    """Generate consistent user ID from email"""
-    return hashlib.sha256(email.lower().encode()).hexdigest()[:16]
+# API Keys & Config
+MG_KEY = os.getenv("MAILGUN_API_KEY", "")
+MG_DOMAIN = os.getenv("MAILGUN_DOMAIN", "")
+REPLY_FROM = os.getenv("REPLY_FROM", "scan@mg.techamped.com")
+GOOGLE_SAFE_BROWSING_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "")
 
-def extract_email(sender: str) -> str:
-    """Extract email from 'Name <email@domain.com>' format"""
-    match = re.search(r'<([^>]+)>', sender)
-    if match:
-        return match.group(1).lower().strip()
-    return sender.lower().strip()
+# Tuning Constants
+MIN_BLOCK_SCORE = int(os.getenv("MIN_BLOCK_SCORE", "15"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.00"))
+STRICT_BAD_TLD = True
+ENABLE_TIPS = True
+FORWARDED_PREFER_ORIGINAL = True
 
-def extract_display_name(sender: str) -> Optional[str]:
-    """Extract display name from sender"""
-    match = re.search(r'^([^<]+)<', sender)
-    if match:
-        name = match.group(1).strip().strip('"').strip("'")
-        if name and '@' not in name:
-            return name
-    return None
+# Internal Placeholder for logic
+UNKNOWN_SENDER_PLACEHOLDER = "unknown_sender_hidden@scan.system"
 
-# ========= Whitelist Functions =========
-def get_whitelist_key(user_id: str, wl_type: str) -> str:
-    """Generate Redis key for whitelist"""
-    return f"whitelist:{user_id}:{wl_type}"
+# ==============================================================================
+# DATA MODELS
+# ==============================================================================
 
-def add_to_whitelist(user_id: str, value: str, wl_type: str = 'email') -> bool:
-    """
-    Add entry to user's whitelist
-    wl_type: 'email', 'domain', or 'sender_name'
-    """
-    if not redis_client:
-        return False
-    
-    try:
-        key = get_whitelist_key(user_id, wl_type)
-        redis_client.sadd(key, value.lower())
-        
-        # Store metadata
-        meta_key = f"{key}:meta:{value.lower()}"
-        redis_client.hset(meta_key, mapping={
-            'added_at': datetime.now(timezone.utc).isoformat(),
-            'type': wl_type,
-            'value': value.lower()
-        })
-        
-        return True
-    except Exception as e:
-        print(f"Failed to add to whitelist: {e}")
-        return False
-
-def remove_from_whitelist(user_id: str, value: str, wl_type: str = 'email') -> bool:
-    """Remove entry from whitelist"""
-    if not redis_client:
-        return False
-    
-    try:
-        key = get_whitelist_key(user_id, wl_type)
-        redis_client.srem(key, value.lower())
-        
-        # Remove metadata
-        meta_key = f"{key}:meta:{value.lower()}"
-        redis_client.delete(meta_key)
-        
-        return True
-    except Exception as e:
-        print(f"Failed to remove from whitelist: {e}")
-        return False
-
-def is_whitelisted(user_id: str, value: str, wl_type: str = 'email') -> bool:
-    """Check if value is whitelisted"""
-    if not redis_client:
-        return False
-    
-    try:
-        key = get_whitelist_key(user_id, wl_type)
-        return redis_client.sismember(key, value.lower())
-    except Exception:
-        return False
-
-def get_whitelist(user_id: str, wl_type: str = 'email') -> Set[str]:
-    """Get all whitelist entries for user"""
-    if not redis_client:
-        return set()
-    
-    try:
-        key = get_whitelist_key(user_id, wl_type)
-        return redis_client.smembers(key)
-    except Exception:
-        return set()
-
-def check_whitelist(user_id: str, sender: str) -> tuple[bool, str]:
-    """
-    Check if sender is whitelisted for this user.
-    Returns (is_whitelisted, reason)
-    """
-    if not redis_client:
-        return False, ""
-    
-    sender_email = extract_email(sender)
-    sender_domain = _domain_of(sender_email)
-    sender_name = extract_display_name(sender)
-    
-    # Check exact email match
-    if is_whitelisted(user_id, sender_email, 'email'):
-        return True, f"whitelisted_email:{sender_email}"
-    
-    # Check domain match
-    if is_whitelisted(user_id, sender_domain, 'domain'):
-        return True, f"whitelisted_domain:{sender_domain}"
-    
-    # Check sender name match
-    if sender_name and is_whitelisted(user_id, sender_name.lower(), 'sender_name'):
-        return True, f"whitelisted_sender_name:{sender_name}"
-    
-    return False, ""
-
-# ========= Blocklist Functions =========
-def get_blocklist_key(user_id: str, bl_type: str) -> str:
-    """Generate Redis key for blocklist"""
-    return f"blocklist:{user_id}:{bl_type}"
-
-def add_to_blocklist(user_id: str, value: str, bl_type: str = 'email') -> bool:
-    """Add entry to user's blocklist"""
-    if not redis_client:
-        return False
-    
-    try:
-        key = get_blocklist_key(user_id, bl_type)
-        redis_client.sadd(key, value.lower())
-        
-        # Store metadata
-        meta_key = f"{key}:meta:{value.lower()}"
-        redis_client.hset(meta_key, mapping={
-            'added_at': datetime.now(timezone.utc).isoformat(),
-            'type': bl_type,
-            'value': value.lower()
-        })
-        
-        return True
-    except Exception as e:
-        print(f"Failed to add to blocklist: {e}")
-        return False
-
-def remove_from_blocklist(user_id: str, value: str, bl_type: str = 'email') -> bool:
-    """Remove entry from user's blocklist"""
-    if not redis_client:
-        return False
-    
-    try:
-        key = get_blocklist_key(user_id, bl_type)
-        redis_client.srem(key, value.lower())
-        
-        # Remove metadata
-        meta_key = f"{key}:meta:{value.lower()}"
-        redis_client.delete(meta_key)
-        
-        return True
-    except Exception as e:
-        print(f"Failed to remove from blocklist: {e}")
-        return False
-
-def is_blocked(user_id: str, value: str, bl_type: str = 'email') -> bool:
-    """Check if value is blocked"""
-    if not redis_client:
-        return False
-    
-    try:
-        key = get_blocklist_key(user_id, bl_type)
-        return redis_client.sismember(key, value.lower())
-    except Exception:
-        return False
-
-def check_blocklist(user_id: str, sender: str) -> tuple[bool, str]:
-    """
-    Check if sender is blocked for this user.
-    Returns (is_blocked, reason)
-    """
-    if not redis_client:
-        return False, ""
-    
-    sender_email = extract_email(sender)
-    sender_domain = _domain_of(sender_email)
-    
-    # Check exact email match
-    if is_blocked(user_id, sender_email, 'email'):
-        return True, f"blocked_email:{sender_email}"
-    
-    # Check domain match
-    if is_blocked(user_id, sender_domain, 'domain'):
-        return True, f"blocked_domain:{sender_domain}"
-    
-    return False, ""
-
-def get_blocklist_count(user_id: str) -> int:
-    """Get total count of blocked senders"""
-    if not redis_client:
-        return 0
-    
-    try:
-        email_count = redis_client.scard(f"blocklist:{user_id}:email") or 0
-        domain_count = redis_client.scard(f"blocklist:{user_id}:domain") or 0
-        return email_count + domain_count
-    except Exception:
-        return 0
-
-# ========= Feedback Recording =========
-def record_feedback(user_id: str, sender: str, subject: str, original_score: int, 
-                    original_verdict: str, user_verdict: str, feedback_type: str):
-    """Record user feedback for training"""
-    if not redis_client:
-        return
-    
-    try:
-        # Create unique feedback ID
-        content_hash = hashlib.sha256(f"{sender}{subject}".encode()).hexdigest()[:16]
-        feedback_key = f"feedback:{user_id}:{content_hash}"
-        
-        redis_client.hset(feedback_key, mapping={
-            'sender': sender,
-            'subject': subject,
-            'original_score': original_score,
-            'original_verdict': original_verdict,
-            'user_verdict': user_verdict,
-            'feedback_type': feedback_type,
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        })
-        
-        # Set expiry (keep for 1 year)
-        redis_client.expire(feedback_key, 31536000)
-        
-        # Add to user's feedback list
-        user_feedback_key = f"user_feedback:{user_id}"
-        redis_client.lpush(user_feedback_key, feedback_key)
-        redis_client.ltrim(user_feedback_key, 0, 999)  # Keep last 1000
-        
-        # Update stats
-        if feedback_type == "SAFE" and original_verdict in ["block", "caution"]:
-            redis_client.incr(f"stats:{user_id}:false_positives")
-        elif feedback_type == "BLOCK" and original_verdict == "safe":
-            redis_client.incr(f"stats:{user_id}:false_negatives")
-        
-    except Exception as e:
-        print(f"Failed to record feedback: {e}")
-
-# ========= Scan History =========
-def record_scan(user_id: str, scan_id: str, sender: str, subject: str, score: int, 
-                verdict: str, category: str, whitelisted: bool, blocked: bool = False):
-    """Record scan for history and analytics"""
-    if not redis_client:
-        return
-    
-    try:
-        timestamp = datetime.now(timezone.utc)
-        scan_key = f"scan:{user_id}:{scan_id}"
-        
-        redis_client.hset(scan_key, mapping={
-            'id': scan_id,
-            'sender': sender,
-            'subject': subject or "No subject",
-            'score': score,
-            'verdict': verdict,
-            'category': category,
-            'whitelisted': str(whitelisted).lower(),
-            'blocked': str(blocked).lower(),
-            'timestamp': timestamp.isoformat()
-        })
-        
-        # Set expiry (keep for 90 days)
-        redis_client.expire(scan_key, 7776000)
-        
-        # Add to sorted set for easy retrieval (timestamp as score)
-        redis_client.zadd(
-            f"scan_history:{user_id}",
-            {scan_key: timestamp.timestamp()}
-        )
-        
-        # Increment monthly scan count
-        monthly_key = f"stats:{user_id}:scans:{timestamp.strftime('%Y-%m')}"
-        redis_client.incr(monthly_key)
-        redis_client.expire(monthly_key, 2678400)  # 31 days
-        
-    except Exception as e:
-        print(f"Failed to record scan: {e}")
-
-def get_scan_history(user_id: str, limit: int = 50) -> List[Dict]:
-    """Get user's scan history"""
-    if not redis_client:
-        return []
-    
-    try:
-        # Get scan keys ordered by timestamp (newest first)
-        history_keys = redis_client.zrevrange(f"scan_history:{user_id}", 0, limit - 1)
-        
-        history = []
-        for key in history_keys:
-            scan_data = redis_client.hgetall(key)
-            if scan_data:
-                history.append({
-                    "id": scan_data.get("id", ""),
-                    "date": scan_data.get("timestamp", ""),
-                    "sender": scan_data.get("sender", "Unknown"),
-                    "subject": scan_data.get("subject", "No subject"),
-                    "verdict": scan_data.get("verdict", ""),
-                    "score": int(scan_data.get("score", 0)),
-                    "whitelisted": scan_data.get("whitelisted", "false") == "true",
-                    "blocked": scan_data.get("blocked", "false") == "true"
-                })
-        
-        return history
-    except Exception as e:
-        print(f"Failed to get scan history: {e}")
-        return []
-
-def get_monthly_scan_count(user_id: str) -> int:
-    """Get user's scan count for current month"""
-    if not redis_client:
-        return 0
-    
-    try:
-        monthly_key = f"stats:{user_id}:scans:{datetime.now().strftime('%Y-%m')}"
-        count = redis_client.get(monthly_key)
-        return int(count) if count else 0
-    except Exception:
-        return 0
-
-# ========= Update Scan With Whitelist Status =========
-def update_scan_whitelist_status(user_id: str, sender: str, subject: str):
-    """Update recent scan to mark as whitelisted after SAFE command"""
-    if not redis_client:
-        return
-    
-    try:
-        # Find most recent scan with matching sender and subject
-        history_keys = redis_client.zrevrange(f"scan_history:{user_id}", 0, 20)
-        
-        for key in history_keys:
-            scan_data = redis_client.hgetall(key)
-            if (scan_data.get("sender", "").lower() == sender.lower() and 
-                scan_data.get("subject", "") == subject):
-                # Update to mark as whitelisted
-                redis_client.hset(key, "whitelisted", "true")
-                # Change verdict to Safe if it wasn't already
-                if scan_data.get("verdict") != "safe":
-                    redis_client.hset(key, "verdict", "safe")
-                break
-                
-    except Exception as e:
-        print(f"Failed to update scan whitelist status: {e}")
-
-def update_scan_blocked_status(user_id: str, sender: str, subject: str):
-    """Update recent scan to mark as blocked after BLOCK command"""
-    if not redis_client:
-        return
-    
-    try:
-        # Find most recent scan with matching sender and subject
-        history_keys = redis_client.zrevrange(f"scan_history:{user_id}", 0, 20)
-        
-        for key in history_keys:
-            scan_data = redis_client.hgetall(key)
-            if (scan_data.get("sender", "").lower() == sender.lower() and 
-                scan_data.get("subject", "") == subject):
-                # Update to mark as blocked
-                redis_client.hset(key, "blocked", "true")
-                redis_client.hset(key, "verdict", "block")
-                break
-                
-    except Exception as e:
-        print(f"Failed to update scan blocked status: {e}")
-
-# ========= Get Simple Explanation =========
-def get_simple_explanation(reason_key: str, context: Dict = None) -> str:
-    context = context or {}
-    explanations = {
-        "phishing_language": "⚠️ Uses language commonly found in phishing attempts",
-        "marketing_language": "📧 Contains typical marketing/promotional language",
-        "business_spam": "💼 Appears to be unsolicited business outreach (B2B spam)",
-        "free_email_cold_outreach": "🎣 Cold outreach from a free email provider (High Risk)",
-        "free_email_business_content": "🚨 Business/Sales content from a free email address (High Likelihood Spam)",
-        "free_email_with_unsubscribe": "🚨 Free email sender using mass-mailing unsubscribe links",
-        "poor_grammar": "📝 Contains grammatical errors common in scams",
-        "tracking_urls_detected": "📊 Contains tracking links that monitor your clicks",
-        "suspicious_tld_detected": "🌐 Uses a suspicious website domain ending (.xyz, .ru, etc.)",
-        "suspicious_link_tld": "⚠️ Email body contains links to suspicious domains",
-        "gibberish_domain_link": "🤖 Links to random/gibberish domain names",
-        "long_query_string_urls": "🔗 Links have unusually long tracking parameters",
-        "url_shorteners_detected": "🔗 Contains shortened URLs that hide the real destination",
-        "all_caps_subject": "🗣️ Subject line in ALL CAPS (aggressive marketing tactic)",
-        "fake_reply_subject": "↩️ Fake 'Re:' or 'Fwd:' in subject (never started a conversation)",
-        "urgency_pressure": "⏰ Creates false urgency to pressure quick action",
-        "generic_greeting": "👤 Uses generic greeting instead of your name",
-        "reply_to_mismatch": "📬 The 'Reply-To' address differs from sender (red flag)",
-        "microsoft_marked_as_spam": "🚩 Microsoft Exchange already flagged this as spam (SCL score)",
-        "spam_filter_verdict_spam": "🚩 Email security system marked this as spam",
-        "categorized_as_spam": "🚩 Automatically categorized as spam by filters",
-        "delivered_to_junk_folder": "🗑️ This was delivered to a junk/spam folder",
-        "forefront_spam_detection": "🚩 Forefront anti-spam system detected spam",
-        "spamassassin_score": "📊 SpamAssassin gave this a high spam score",
-        "barracuda_spam_score_high": "🚩 Barracuda spam filter scored this highly",
-        "generic_cold_outreach_subject": "📧 Generic cold outreach subject line",
-        "generic_cold_outreach_subject_free_email": "🎣 Typical cold spam subject from free email account",
-        "overly_casual_greeting_from_stranger": "👋 Overly casual greeting from unknown sender",
-        "sales_pitch_question": "💼 Question-based sales pitch pattern",
-        "sender_name_email_mismatch": "⚠️ Sender name doesn't match email address",
-        "sender_name_email_mismatch_free_provider": "🚨 Sender name completely unrelated to Gmail address (red flag)",
-        "whitelisted_email": "✅ Sender email is on your trusted whitelist",
-        "whitelisted_domain": "✅ Sender domain is on your trusted whitelist", 
-        "whitelisted_sender_name": "✅ Sender name is on your trusted whitelist",
-        "whitelisted_score_reduced": "ℹ️ Score reduced because sender is whitelisted",
-        "blocked_email": "🚫 Sender email is on your blocklist",
-        "blocked_domain": "🚫 Sender domain is on your blocklist",
-        "malicious_url_detected": "⛔ DANGER: Contains a confirmed malicious URL (Google Safe Browsing)",
-        "forwarded_unsubscribe_header": "📧 Detected unsubscribe header in forwarded email (Marketing)",
-        "marketing_unsubscribe_link_in_body": "📧 Found 'unsubscribe' link in email body",
-        "high_link_density": "🔗 Unusually high number of links for the email length",
-        "bayesian_spam_content": "🤖 Content analysis indicates spam patterns",
-    }
-    
-    base = explanations.get(reason_key.split(":")[0], f"Flagged: {reason_key}")
-    
-    # Add context for whitelisted items
-    if ":" in reason_key and (reason_key.startswith("whitelisted") or reason_key.startswith("blocked")):
-        parts = reason_key.split(":", 1)
-        if len(parts) > 1:
-            base += f" ({parts[1]})"
-    
-    return base
-
-# ========= Pydantic Models =========
 class ScanBody(BaseModel):
     sender: str
     subject: str = ""
     email_text: str = ""
 
-# ========= Build/Env Diagnostics =========
-GIT_SHA = os.environ.get("VERCEL_GIT_COMMIT_SHA", "local")
-BUILD_TIME = os.environ.get("BUILD_TIME", datetime.now(timezone.utc).isoformat())
-VERCEL_URL = os.environ.get("VERCEL_URL", "")
+class WhitelistAddRequest(BaseModel):
+    user_email: str
+    type: str
+    value: str
 
-# ========= Tunables (TIGHTENED MODE) =========
-MIN_BLOCK_SCORE = int(os.getenv("MIN_BLOCK_SCORE", "15")) # Default to 15 (Strict)
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.00"))
-STRICT_BAD_TLD = True
+class WhitelistRemoveRequest(BaseModel):
+    user_email: str
+    type: str
+    value: str
 
-ENABLE_URL_EXPANSION = os.getenv("ENABLE_URL_EXPANSION", "1") == "1"
-ENABLE_TIPS = os.getenv("ENABLE_TIPS", "1") == "1"
-FORWARDED_PREFER_ORIGINAL = os.getenv("FORWARDED_PREFER_ORIGINAL", "1") == "1"
+class BlocklistAddRequest(BaseModel):
+    user_email: str
+    type: str
+    value: str
 
-# ✅ Google Safe Browsing API key
-GOOGLE_SAFE_BROWSING_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "")
+class BlocklistRemoveRequest(BaseModel):
+    user_email: str
+    type: str
+    value: str
 
-# ========= Heuristics =========
+# ==============================================================================
+# DICTIONARIES & VOCABULARY
+# ==============================================================================
+
+SUSPICIOUS_TLDS = {
+    "xyz", "click", "top", "ru", "cn", "icu", "zip", "mov", "quest", "gq",
+    "country", "work", "fit", "tk", "cf", "ml", "ga", "pw", "cc", "win",
+    "bid", "loan", "date", "review", "party", "cam"
+}
+
+FREE_EMAIL_SENDERS = {
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", 
+    "icloud.com", "aol.com", "protonmail.com", "mail.com"
+}
+
+TRUSTED_DOMAINS = {
+    "salesforce.com", "sonicwall.com", "microsoft.com", "google.com",
+    "amazon.com", "apple.com", "adobe.com", "dropbox.com", "slack.com",
+    "github.com", "gitlab.com", "atlassian.com", "zoom.us", "teams.microsoft.com",
+    "linkedin.com", "twitter.com", "facebook.com", "instagram.com",
+    "paypal.com", "stripe.com", "square.com", "shopify.com",
+    "netflix.com", "spotify.com", "youtube.com", "twitch.tv",
+    "airbnb.com", "uber.com", "lyft.com", "doordash.com",
+    "bankofamerica.com", "chase.com", "wellsfargo.com", "citi.com",
+    "nasa.gov", "gov.uk", "edu", "arkay.com", "nytimes.com"
+}
+
+URL_SHORTENERS = {
+    "bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "t.co", "buff.ly",
+    "adf.ly", "short.link", "tiny.cc", "is.gd", "cli.gs", "amzn.to",
+    "tr.im", "lc.chat"
+}
+
 PHISHING_WORDS = [
     r"verify your account", r"reset your password", r"unauthorized login",
     r"unusual activity", r"update payment", r"wire transfer",
     r"crypto wallet", r"bank account", r"urgent action required",
     r"confirm your identity", r"2fa.*disable", r"limited time verification",
     r"suspended.*account", r"account.*locked", r"account.*limited",
-    r"reactivate.*account", r"unusual.*activity", r"security.*alert",
+    r"reactivate.*account", r"unusual.*activity", r"security.*alert"
 ]
 
 JUNK_WORDS = [
     r"unsubscribe", r"newsletter", r"flash sale", r"discount", r"coupon",
     r"special offer", r"bundle", r"limited time", r"promo", r"view in browser",
     r"no[- ]?reply", r"do not reply", r"manage preferences",
-    # AGGRESSIVE MARKETING ADDITIONS
     r"act fast", r"act now", r"hurry", r"don't miss", r"don't wait",
     r"\d{1,3}%\s*off", r"\bsale\b", r"clearance", r"\bdeals?\b",
     r"shop now", r"buy now", r"order now", r"get it now",
     r"exclusive offer", r"today only", r"expires", r"last chance",
     r"free shipping", r"lowest price", r"limited quantity",
-    r"while supplies last", r"final hours", r"ending soon",
+    r"while supplies last", r"final hours", r"ending soon"
 ]
 
 BUSINESS_SPAM_WEIGHTS = {
-    # High-confidence indicators (likely spam)
-    r"\blead generation\b": 20,
-    r"\bappointment setting\b": 20,
-    r"\bqualified leads?\b": 20,
-    r"\bdemand generation\b": 15,
-    r"\bb2b outreach\b": 15,
-    r"\brevops\b|\bsalesops\b": 15,
-    r"\bscale your (team|revenue|sales)\b": 15,
-    r"\bwhite label\b": 15,
-    r"\boffshore team\b": 15,
-    r"\boutsourcing\b": 15,
-
-    # Medium-confidence (could be legit, but often spam)
+    r"\blead generation\b": 20, r"\bappointment setting\b": 20,
+    r"\bqualified leads?\b": 20, r"\bdemand generation\b": 15,
+    r"\bb2b outreach\b": 15, r"\brevops\b|\bsalesops\b": 15,
+    r"\bscale your (team|revenue|sales)\b": 15, r"\bwhite label\b": 15,
+    r"\boffshore team\b": 15, r"\boutsourcing\b": 15,
     r"\bhir(e|ing) (developers?|engineers?|designers?)\b": 10,
-    r"\bstaff(ing)?\b": 10,
-    r"\brecruit(er|ment|ing)\b": 10,
-    r"\bnearshore\b|\boffshore\b": 10,
-    r"\boutsourc(e|ing)\b": 10,
-    r"\bfractional (cto|cmo|cfo)\b": 10,
-    r"\bbook(ing)? a (call|demo)\b": 10,
-    r"\bseo ranking\b": 10,
-    r"\bfirst page of google\b": 10,
-    r"\bweb development\b": 10,
-
-    # Lower-confidence (often legit, but can be spammy)
-    r"\breach(ing)? out\b": 5,
-    r"\bagency\b": 5,
-    r"\bcase study\b": 5,
-    r"\bproposal\b|\brfp\b": 5,
-    r"\baudit of your\b": 5,
-    r"\bcalendar link\b": 5,
-    r"\btalent\s+ready\b": 5,
-    r"\bcollaboration\b": 5,
-    r"\bpartnership\b": 5,
+    r"\bstaff(ing)?\b": 10, r"\brecruit(er|ment|ing)\b": 10,
+    r"\bnearshore\b|\boffshore\b": 10, r"\boutsourc(e|ing)\b": 10,
+    r"\bfractional (cto|cmo|cfo)\b": 10, r"\bbook(ing)? a (call|demo)\b": 10,
+    r"\bseo ranking\b": 10, r"\bfirst page of google\b": 10,
+    r"\bweb development\b": 10, r"\breach(ing)? out\b": 5,
+    r"\bagency\b": 5, r"\bcase study\b": 5, r"\bproposal\b|\brfp\b": 5,
+    r"\baudit of your\b": 5, r"\bcalendar link\b": 5,
+    r"\btalent\s+ready\b": 5, r"\bcollaboration\b": 5,
+    r"\bpartnership\b": 5
 }
 
-POOR_GRAMMAR_INDICATORS = [
-    r"\bpls\b", r"\bplz\b", r"\burgen[ct]", r"dear (customer|user|client|member)\b",
-    r"kindly ", r"revert back", r"do the needful", r"same will be",
-]
-
-TRACKING_HOST_HINTS = {
-    "click", "trk", "track", "r.", "l.", "links.", "email.", "mandrillapp",
-    "sendgrid", "hubspot", "safelinks", "list-manage", "postmarkapp",
-    "mailchimp", "emltrk", "route.", "bounce.",
-}
-
-SUSPICIOUS_TLDS = {
-    "xyz", "click", "top", "ru", "cn", "icu", "zip", "mov", "quest", "gq",
-    "country", "work", "fit", "tk", "cf", "ml", "ga", "pw", "cc", "win", "bid", "loan"
-}
-
-FREE_EMAIL_SENDERS = {
-    "gmail.com","yahoo.com","outlook.com","hotmail.com","icloud.com","aol.com"
-}
-
-# Trusted domains - Reduced list to avoid false negatives on compromised accounts
-TRUSTED_DOMAINS = {
-    "salesforce.com", "sonicwall.com", "microsoft.com", "google.com",
-    "amazon.com", "apple.com", "stripe.com", "shopify.com",
-    "github.com", "atlassian.com", "zoom.us", "slack.com",
-    "linkedin.com", "paypal.com", "bankofamerica.com", "chase.com",
-    "nasa.gov", "gov.uk", "edu"
-}
-
-URL_SHORTENERS = {
-    "bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "t.co", "buff.ly",
-    "adf.ly", "short.link", "tiny.cc", "is.gd", "cli.gs",
-}
-
-# ========= Precompiled regex =========
-URL_RE = re.compile(r"""(?ix)\bhttps?://[^\s<>()"']+""")
-RE_REPLYTO = re.compile(r"reply[- ]?to:\s*<?([^>\s]+@[^>\s]+)>?", re.I)
-RE_ALPHA = re.compile(r"[^A-Za-z]+")
-
-# ========= Helpers =========
-def _domain_of(addr: str) -> str:
-    try:
-        return (addr or "").split("@", 1)[-1].lower()
-    except Exception:
-        return ""
-
-def extract_urls(text: str) -> List[str]:
-    return URL_RE.findall(text or "")
-
-def _is_all_caps(s: str) -> bool:
-    s = (s or "").strip()
-    letters = RE_ALPHA.sub("", s)
-    return bool(letters) and letters.isupper()
-
-# Extract original sender from forwarded emails
-def detect_forwarded_original_sender(body: str) -> str | None:
-    if not body:
-        return None
-        
-    # CLEANUP: text often comes with * markers or extra spaces in forwards
-    clean_body = body.replace("*", "").strip()
-    
-    patterns = [
-        # Standard Forward: "From: Name <email@domain.com>" (Handle quoted and unquoted names)
-        r'From:.*?\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
-        
-        # "Sender: email@domain.com"
-        r'Sender:\s*<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?',
-        
-        # "Begin forwarded message: ... From: ..."
-        r'Begin forwarded message:.*?From:.*?\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
-        
-        # "Forwarded message ... From: ..."
-        r'Forwarded message.*?From:.*?\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
-    ]
-    
-    for pattern in patterns:
-        # Use DOTALL so . matches newlines
-        match = re.search(pattern, clean_body, re.IGNORECASE | re.DOTALL)
-        if match:
-            email = match.group(1).lower().strip()
-            # Validate it looks like an email and ignore the user's own email if caught by accident
-            if email and '@' in email:
-                return email
-    return None
-
-# ========= Email Header Analysis for Forwarded Emails =========
-def analyze_email_headers(body: str) -> List[Tuple[str, int]]:
-    """
-    Analyze email headers present in forwarded email body.
-    Returns a list of (reason, score) tuples.
-    """
-    contributions = []
-    
-    if not body:
-        return []
-    
-    body_lower = body.lower()
-    
-    # Microsoft Exchange spam markers
-    if re.search(r'scl:\s*([5-9]|1[0-9])', body_lower):
-        contributions.append(("microsoft_marked_as_spam", 25))
-    
-    # Spam filter verdicts
-    if re.search(r'sfv:\s*spm', body_lower):
-        contributions.append(("spam_filter_verdict_spam", 25))
-    
-    if re.search(r'cat:\s*spm', body_lower):
-        contributions.append(("categorized_as_spam", 20))
-    
-    # Junk folder delivery
-    if re.search(r'rf:\s*junkemail', body_lower):
-        contributions.append(("delivered_to_junk_folder", 20))
-    
-    # Forefront anti-spam detection
-    if re.search(r'x-forefront-antispam-report:.*spm', body_lower):
-        contributions.append(("forefront_spam_detection", 15))
-    
-    # SpamAssassin scores (if present)
-    spam_score_match = re.search(r'x-spam-score:\s*([\d.]+)', body_lower)
-    if spam_score_match:
-        spam_score = float(spam_score_match.group(1))
-        if spam_score >= 5.0:
-            contributions.append((f"spamassassin_score:{spam_score}", 30))
-        elif spam_score >= 3.0:
-            contributions.append((f"spamassassin_score:{spam_score}", 15))
-    
-    return contributions
-
-
-def detect_marketing_email(body: str, subject: str, sender: str = "") -> List[Tuple[str, int]]:
-    """
-    AGGRESSIVE marketing/promotional email detection
-    """
-    contributions = []
-    
-    combined = f"{subject} {body}".lower()
-    body_lower = body.lower()
-    
-    # List-Unsubscribe header = DEFINITIVE marketing email
-    # Also checks for "List-Unsubscribe" text in the BODY (for forwards)
-    if 'list-unsubscribe:' in body_lower:
-        contributions.append(("forwarded_unsubscribe_header", 40))
-    
-    # FIX: Check for footer links common in forwarded newsletters
-    # Even if the header is gone, the body text usually remains.
-    if "unsubscribe" in body_lower:
-        # Check for context to avoid false positives on normal emails discussing "unsubscribe"
-        if any(x in body_lower for x in ["click here to", "preferences", "opt-out", "browser", "subscription", "manage your"]):
-            contributions.append(("marketing_unsubscribe_link_in_body", 40))
-    
-    # Precedence: bulk header
-    if (re.search(r'precedence\s*:\s*bulk', body_lower, re.I) or 
-        re.search(r'precedence\s*bulk', body_lower, re.I)):
-        contributions.append(("precedence_bulk_header", 20))
-    
-    # Tracking URLs (common in marketing emails)
-    if re.search(r'tracking[.-]', body_lower) or re.search(r'/track/', body_lower):
-        contributions.append(("tracking_url_detected", 20))
-    
-    # Discount/sale language
-    discount_patterns = [
-        r'\d{1,3}%\s*off',
-        r'save\s+[\$€£]?\d+',
-        r'up to \d+%',
-        r'[\$€£]\d+\s+off',
-        r'\d{1,3}%\s*discount',
-    ]
-    discount_count = sum(1 for p in discount_patterns if re.search(p, combined, re.I))
-    if discount_count > 0:
-        contributions.append((f"discount_language:{discount_count}_instances", discount_count * 12))
-    
-    # Urgency tactics in marketing
-    urgency_marketing = [
-        r'act fast', r'act now', r'limited time',
-        r'hurry', r"don't miss", r'today only',
-        r'expires', r'last chance', r'final hours',
-        r'while supplies last', r'ending soon',
-    ]
-    urgency_count = sum(1 for p in urgency_marketing if re.search(p, combined, re.I))
-    if urgency_count >= 2:
-        contributions.append((f"marketing_urgency:{urgency_count}_tactics", 35))
-    elif urgency_count == 1:
-        contributions.append(("marketing_urgency:1_tactic", 15))
-    
-    # Shop/Buy commands
-    if re.search(r'(shop|buy|order|get it)\s+now', combined, re.I):
-        contributions.append(("marketing_call_to_action", 12))
-    
-    # Email has BOTH unsubscribe AND urgency/discount = confirmed marketing spam
-    if 'unsubscribe' in combined and (urgency_count > 0 or discount_count > 0):
-        contributions.append(("confirmed_marketing_spam", 50))
-
-    # Urgent subject line detection
-    if re.search(r'\[.*!\]|TODAY|NOW|URGENT|LIMITED|LAST CHANCE', subject, re.I):
-        contributions.append(("urgent_subject_markers", 30))
-    
-    # Newsletter-specific patterns
-    if re.search(r'view (in|this email in) (your )?browser', combined, re.I):
-        contributions.append(("newsletter_view_in_browser", 15))
-    
-    # Promotional sender domains
-    promo_domains = [
-        'news.', 'newsletter.', 'promo.', 'marketing.',
-        'updates.', 'email.', 'mail.', 'info.',
-    ]
-    if any(d in body_lower for d in promo_domains):
-        contributions.append(("promotional_sender_domain", 10))
-    
-    # Email preferences/manage subscription links
-    if re.search(r'(manage|update) (your )?(email )?(preferences|subscription)', combined, re.I):
-        contributions.append(("marketing_preferences_link", 12))
-    
-    # Marketing platform detection (EXPANDED - includes e-commerce platforms)
-    marketing_platforms = [
-        ('clickfunnels', 'clickfunnelsnotifications.com', 'myclickfunnels.com'),
-        ('hubspot', 'hubspotlinks.com', 'hs-email.net'),
-        ('mailchimp', 'list-manage.com', 'mailchi.mp'),
-        ('sendgrid', 'sendgrid.net', 'sendgrid.com'),
-        ('constant contact', 'constantcontact.com'),
-        ('activecampaign', 'activecampaign.com'),
-        ('convertkit', 'convertkit.com'),
-        ('drip', 'drip.com', 'getdrip.com'),
-        ('aweber', 'aweber.com'),
-        ('infusionsoft', 'infusionsoft.com', 'keap.com'),
-        ('shopify', 'email.shopify.com', 'shopifyemail.com', 'shopify.com'),
-        ('klaviyo', 'klaviyo.com', 'klaviyomail.com'),
-        ('omnisend', 'omnisend.com'),
-        ('brevo', 'brevo.com', 'sendinblue.com'),
-        ('getresponse', 'getresponse.com'),
-        ('mailerlite', 'mailerlite.com'),
-        ('moosend', 'moosend.com'),
-        ('benchmark', 'benchmarkemail.com'),
-    ]
-
-    sender_combined = f"{sender} {subject} {body}".lower()
-    for platform_keywords in marketing_platforms:
-        if any(keyword in sender_combined for keyword in platform_keywords):
-            platform_name = platform_keywords[0]
-            contributions.append((f"marketing_platform:{platform_name}", 30))
-            break
-    
-    # Multiple long tracking URLs
-    tracking_url_count = len(re.findall(r'https?://[^\s<>()"\']{50,}', body))
-    if tracking_url_count >= 3:
-        contributions.append(("multiple_tracking_urls", 25))
-    elif tracking_url_count >= 1:
-        contributions.append(("tracking_url_present", 12))
-    
-    return contributions
-
-# ========= Enhanced Subject Line Analysis =========
-def analyze_suspicious_subject(subject: str, sender: str) -> List[Tuple[str, int]]:
-    """
-    Detect common spam subject patterns
-    """
-    contributions = []
-    
-    if not subject:
-        return []
-    
-    subject_lower = subject.lower()
-    sender_dom = _domain_of(sender)
-    
-    # Generic relationship-building spam
-    generic_patterns = [
-        r'\blove your (product|service|website|site|work|company|products)\b',
-        r'\bimpressed (by|with) your\b',
-        r'\bquick question\b',
-        r'\breached? out\b',
-        r'\bsaw your (product|service|website|site|work)\b',
-        r'\b(quick|simple|brief) (question|inquiry)\b',
-        r'\bcurious about\b',
-        r'\binterested in (working|partnering|collaborating)\b',
-    ]
-    
-    for pattern in generic_patterns:
-        if re.search(pattern, subject_lower):
-            # Higher score if from free email
-            if sender_dom in FREE_EMAIL_SENDERS:
-                contributions.append(("generic_cold_outreach_subject_free_email", 15))
-            else:
-                contributions.append(("generic_cold_outreach_subject", 8))
-            break
-    
-    # Overly friendly subjects from strangers
-    if re.search(r'^(hi|hello|hey)[\s,!]+', subject_lower):
-        if sender_dom in FREE_EMAIL_SENDERS:
-            contributions.append(("overly_casual_greeting_from_stranger", 10))
-    
-    # Question marks with generic business terms
-    if '?' in subject and re.search(r'\b(partnership|collaboration|service|solution|offer)\b', subject_lower):
-        if sender_dom in FREE_EMAIL_SENDERS:
-            contributions.append(("sales_pitch_question", 8))
-    
-    return contributions
-
-# ========= Sender Name vs Email Mismatch Detection =========
-def check_sender_name_email_mismatch(sender: str, body: str) -> List[Tuple[str, int]]:
-    """
-    Detect when sender name doesn't match email address (common in spam)
-    Example: "John Smith <randomshop123@gmail.com>"
-    """
-    contributions = []
-    
-    # Extract display name if present
-    name_match = re.search(r'^([^<]+)<([^>]+)>$', sender.strip())
-    if not name_match:
-        return []
-    
-    display_name = name_match.group(1).strip().lower()
-    email_addr = name_match.group(2).strip().lower()
-    sender_dom = _domain_of(email_addr)
-    
-    # Skip if no real display name
-    if not display_name or '@' in display_name:
-        return []
-    
-    # Check if name components are in email
-    name_parts = re.findall(r'\w+', display_name)
-    email_parts = re.findall(r'\w+', email_addr.split('@')[0])
-    
-    # Check for matches
-    has_match = any(part in email_parts for part in name_parts if len(part) > 2)
-    
-    if not has_match and sender_dom in FREE_EMAIL_SENDERS:
-        contributions.append(("sender_name_email_mismatch_free_provider", 12))
-    elif not has_match:
-        contributions.append(("sender_name_email_mismatch", 6))
-    
-    return contributions
-
-# ========= Bayesian Scoring (EXPANDED VOCAB) =========
 SPAM_VOCAB = {
     "free": 10, "win": 8, "winner": 5, "prize": 7, "claim": 6, "urgent": 9,
     "limited": 8, "offer": 10, "deal": 7, "subscribe": 5, "unsubscribe": 10,
@@ -905,1121 +184,1266 @@ SPAM_VOCAB = {
     "suspended": 8, "locked": 8, "action": 7, "required": 6, "immediately": 7,
     "bonus": 8, "exclusive": 7, "opportunity": 6, "passive": 7, "income": 7,
     "calendar": 6, "meeting": 5, "call": 5, "zoom": 5, "demo": 6, "audit": 6,
-    "complimentary": 7, "gift": 7, "vouchers": 7, "rates": 5, "quota": 6,
+    "complimentary": 7, "gift": 7, "vouchers": 7, "rates": 5, "quota": 6
 }
 
 HAM_VOCAB = {
     "meeting": 10, "project": 9, "team": 8, "document": 8, "attached": 9,
-    "update": 7, "report": 7, "schedule": 6, "call": 6, "discussion": 7,
-    "feedback": 6, "request": 7, "question": 8, "following": 5, "invoice": 5,
-    "payment": 5, "reminder": 6, "thanks": 10, "best": 8, "regards": 10,
-    "sincerely": 8, "forwarded": 5, "link": 5, "issue": 6, "bug": 5, "fix": 5,
-    "pull": 5, "merge": 5, "commit": 5,
+    "update": 7, "report": 7, "schedule": 6, "discussion": 7, "feedback": 6,
+    "request": 7, "question": 8, "following": 5, "invoice": 5, "payment": 5,
+    "reminder": 6, "thanks": 10, "best": 8, "regards": 10, "sincerely": 8,
+    "forwarded": 5, "link": 5, "issue": 6, "bug": 5, "fix": 5,
+    "pull": 5, "merge": 5, "commit": 5
 }
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+def get_user_id_from_email(email: str) -> str:
+    return hashlib.sha256(email.lower().encode()).hexdigest()[:16]
+
+def extract_email(sender: str) -> str:
+    match = re.search(r'<([^>]+)>', sender)
+    if match:
+        return match.group(1).lower().strip()
+    return sender.lower().strip()
+
+def extract_display_name(sender: str) -> Optional[str]:
+    match = re.search(r'^([^<]+)<', sender)
+    if match:
+        name = match.group(1).strip().strip('"').strip("'")
+        if name and '@' not in name: return name
+    return None
+
+def _domain_of(addr: str) -> str:
+    try: return (addr or "").split("@", 1)[-1].lower()
+    except Exception: return ""
+
+def extract_urls(text: str) -> List[str]:
+    return re.findall(r'https?://[^\s<>()"\'?]+', text)
+
+def _is_all_caps(s: str) -> bool:
+    s = (s or "").strip()
+    letters = re.sub(r"[^A-Za-z]+", "", s)
+    return bool(letters) and letters.isupper()
+
+def validate_email_format(email: str) -> bool:
+    if not email or len(email) > 254: return False
+    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    return bool(email_pattern.match(email))
+
+# ==============================================================================
+# DATABASE OPERATIONS (Redis)
+# ==============================================================================
+
+def get_whitelist_key(user_id: str, wl_type: str) -> str:
+    return f"whitelist:{user_id}:{wl_type}"
+
+def get_blocklist_key(user_id: str, bl_type: str) -> str:
+    return f"blocklist:{user_id}:{bl_type}"
+
+def add_to_whitelist(user_id: str, value: str, wl_type: str = 'email') -> bool:
+    if not redis_client: return False
+    try:
+        key = get_whitelist_key(user_id, wl_type)
+        redis_client.sadd(key, value.lower())
+        redis_client.hset(f"{key}:meta:{value.lower()}", mapping={
+            'added_at': datetime.now(timezone.utc).isoformat(),
+            'type': wl_type, 'value': value.lower()
+        })
+        redis_client.srem(get_blocklist_key(user_id, wl_type), value.lower())
+        return True
+    except Exception: return False
+
+def remove_from_whitelist(user_id: str, value: str, wl_type: str = 'email') -> bool:
+    if not redis_client: return False
+    try:
+        key = get_whitelist_key(user_id, wl_type)
+        redis_client.srem(key, value.lower())
+        redis_client.delete(f"{key}:meta:{value.lower()}")
+        return True
+    except Exception: return False
+
+def is_whitelisted(user_id: str, value: str, wl_type: str = 'email') -> bool:
+    if not redis_client: return False
+    return redis_client.sismember(get_whitelist_key(user_id, wl_type), value.lower())
+
+def get_whitelist(user_id: str, wl_type: str = 'email') -> Set[str]:
+    if not redis_client: return set()
+    return redis_client.smembers(get_whitelist_key(user_id, wl_type))
+
+def check_whitelist(user_id: str, sender: str) -> tuple[bool, str]:
+    if not redis_client: return False, ""
+    sender_email = extract_email(sender)
+    sender_domain = _domain_of(sender_email)
+    sender_name = extract_display_name(sender)
+    
+    if is_whitelisted(user_id, sender_email, 'email'):
+        return True, f"whitelisted_email:{sender_email}"
+    if is_whitelisted(user_id, sender_domain, 'domain'):
+        return True, f"whitelisted_domain:{sender_domain}"
+    if sender_name and is_whitelisted(user_id, sender_name.lower(), 'sender_name'):
+        return True, f"whitelisted_sender_name:{sender_name}"
+    return False, ""
+
+def add_to_blocklist(user_id: str, value: str, bl_type: str = 'email') -> bool:
+    if not redis_client: return False
+    try:
+        key = get_blocklist_key(user_id, bl_type)
+        redis_client.sadd(key, value.lower())
+        redis_client.hset(f"{key}:meta:{value.lower()}", mapping={
+            'added_at': datetime.now(timezone.utc).isoformat(),
+            'type': bl_type, 'value': value.lower()
+        })
+        redis_client.srem(get_whitelist_key(user_id, bl_type), value.lower())
+        return True
+    except Exception: return False
+
+def remove_from_blocklist(user_id: str, value: str, bl_type: str = 'email') -> bool:
+    if not redis_client: return False
+    try:
+        key = get_blocklist_key(user_id, bl_type)
+        redis_client.srem(key, value.lower())
+        redis_client.delete(f"{key}:meta:{value.lower()}")
+        return True
+    except Exception: return False
+
+def is_blocked(user_id: str, value: str, bl_type: str = 'email') -> bool:
+    if not redis_client: return False
+    return redis_client.sismember(get_blocklist_key(user_id, bl_type), value.lower())
+
+def check_blocklist(user_id: str, sender: str) -> tuple[bool, str]:
+    if not redis_client: return False, ""
+    sender_email = extract_email(sender)
+    sender_domain = _domain_of(sender_email)
+    
+    if is_blocked(user_id, sender_email, 'email'):
+        return True, f"blocked_email:{sender_email}"
+    if is_blocked(user_id, sender_domain, 'domain'):
+        return True, f"blocked_domain:{sender_domain}"
+    return False, ""
+
+def get_blocklist_count(user_id: str) -> int:
+    if not redis_client: return 0
+    return (redis_client.scard(f"blocklist:{user_id}:email") or 0) + \
+           (redis_client.scard(f"blocklist:{user_id}:domain") or 0)
+
+# ========= Stats & History =========
+
+def record_scan(user_id: str, scan_id: str, sender: str, subject: str, score: int, 
+                verdict: str, category: str, whitelisted: bool, blocked: bool = False):
+    if not redis_client: return
+    try:
+        timestamp = datetime.now(timezone.utc)
+        scan_key = f"scan:{user_id}:{scan_id}"
+        redis_client.hset(scan_key, mapping={
+            'id': scan_id, 'sender': sender, 'subject': subject or "No subject",
+            'score': score, 'verdict': verdict, 'category': category,
+            'whitelisted': str(whitelisted).lower(), 'blocked': str(blocked).lower(),
+            'timestamp': timestamp.isoformat()
+        })
+        redis_client.expire(scan_key, 7776000)
+        redis_client.zadd(f"scan_history:{user_id}", {scan_key: timestamp.timestamp()})
+        monthly_key = f"stats:{user_id}:scans:{timestamp.strftime('%Y-%m')}"
+        redis_client.incr(monthly_key)
+        redis_client.expire(monthly_key, 2678400)
+    except Exception as e: print(f"Failed to record scan: {e}")
+
+def get_scan_history(user_id: str, limit: int = 50) -> List[Dict]:
+    if not redis_client: return []
+    try:
+        history_keys = redis_client.zrevrange(f"scan_history:{user_id}", 0, limit - 1)
+        history = []
+        for key in history_keys:
+            scan_data = redis_client.hgetall(key)
+            if scan_data:
+                history.append({
+                    "id": scan_data.get("id", ""), "date": scan_data.get("timestamp", ""),
+                    "sender": scan_data.get("sender", "Unknown"),
+                    "subject": scan_data.get("subject", "No subject"),
+                    "verdict": scan_data.get("verdict", ""),
+                    "score": int(scan_data.get("score", 0)),
+                    "whitelisted": scan_data.get("whitelisted", "false") == "true",
+                    "blocked": scan_data.get("blocked", "false") == "true"
+                })
+        return history
+    except Exception: return []
+
+def get_monthly_scan_count(user_id: str) -> int:
+    if not redis_client: return 0
+    try:
+        return int(redis_client.get(f"stats:{user_id}:scans:{datetime.now().strftime('%Y-%m')}") or 0)
+    except Exception: return 0
+
+# ==============================================================================
+# SPAM ANALYSIS LOGIC
+# ==============================================================================
+
+def get_simple_explanation(reason_key: str) -> str:
+    explanations = {
+        "phishing_language": "Suspicious Phishing Keywords",
+        "marketing_language": "Marketing/Sales Language",
+        "business_spam": "B2B / Cold Outreach Pattern",
+        "free_email_cold_outreach": "Business Outreach from Free Email",
+        "free_email_business_content": "Business Content from Free Email",
+        "free_email_with_unsubscribe": "Free Email with Unsubscribe Link",
+        "poor_grammar": "Poor Grammar/Spelling",
+        "tracking_urls_detected": "Tracking Links Detected",
+        "suspicious_tld_detected": "Suspicious Domain (.xyz, .ru, etc)",
+        "suspicious_link_tld": "Link to Suspicious Domain",
+        "gibberish_domain_link": "Link to Gibberish Domain",
+        "long_query_string_urls": "Complex Tracking URLs",
+        "url_shorteners_detected": "URL Shortener Used",
+        "all_caps_subject": "Aggressive ALL CAPS Subject",
+        "urgency_pressure": "Urgency/Pressure Tactics",
+        "generic_greeting": "Generic Greeting",
+        "reply_to_mismatch": "Reply-To Address Mismatch",
+        "microsoft_marked_as_spam": "Flagged by Microsoft Exchange",
+        "spam_filter_verdict_spam": "Flagged by Upstream Filter",
+        "categorized_as_spam": "Categorized as Spam",
+        "delivered_to_junk_folder": "Originally delivered to Junk",
+        "forefront_spam_detection": "Forefront Security Flag",
+        "spamassassin_score": "High SpamAssassin Score",
+        "barracuda_spam_score_high": "High Barracuda Score",
+        "generic_cold_outreach_subject": "Cold Outreach Subject Line",
+        "sender_name_email_mismatch": "Sender Name/Email Mismatch",
+        "whitelisted_email": "Sender in Your Whitelist",
+        "whitelisted_domain": "Domain in Your Whitelist", 
+        "whitelisted_sender_name": "Sender Name in Whitelist",
+        "whitelisted_score_reduced": "Whitelist Bonus Applied",
+        "blocked_email": "Sender in Blocklist",
+        "blocked_domain": "Domain in Blocklist",
+        "malicious_url_detected": "MALICIOUS URL DETECTED",
+        "forwarded_unsubscribe_header": "Unsubscribe Header Detected",
+        "marketing_unsubscribe_link_in_body": "Unsubscribe Link in Body",
+        "high_link_density": "High Density of Links",
+        "bayesian_spam_content": "Content Analysis (Spam Pattern)",
+        "bayesian_ham_bonus": "Content Analysis (Legitimate Pattern)",
+        "trusted_domain_bonus": "Trusted Domain Bonus",
+        "trusted_sender_bonus": "Trusted Sender Bonus",
+        "unverified_sender_source": "Sender Could Not Be Verified",
+        "lead_gen_spam": "Lead Generation Spam",
+        "outsourcing_spam": "Outsourcing/Offshore Spam",
+        "cold_call_request": "Cold Call/Meeting Request"
+    }
+    key_base = reason_key.split(":")[0]
+    return explanations.get(key_base, reason_key.replace("_", " ").title())
 
 def calculate_bayesian_score(text: str) -> float:
     text_words = set(re.findall(r'\b\w+\b', text.lower()))
+    total_spam = sum(SPAM_VOCAB.values())
+    total_ham = sum(HAM_VOCAB.values())
+    vocab_size = len(set(SPAM_VOCAB.keys()) | set(HAM_VOCAB.keys()))
     
-    total_spam_words = sum(SPAM_VOCAB.values())
-    total_ham_words = sum(HAM_VOCAB.values())
-    
-    # Prior probabilities
-    p_spam = 0.5
-    p_ham = 0.5
-
-    log_spam_prob = math.log(p_spam)
-    log_ham_prob = math.log(p_ham)
-
-    vocab = set(SPAM_VOCAB.keys()) | set(HAM_VOCAB.keys())
+    log_spam = math.log(0.5)
+    log_ham = math.log(0.5)
     
     for word in text_words:
         if len(word) > 2 and len(word) < 20:
-            # Calculate P(word | Spam) with Laplace smoothing
-            p_word_spam = (SPAM_VOCAB.get(word, 0) + 1) / (total_spam_words + len(vocab))
-            log_spam_prob += math.log(p_word_spam)
-            
-            # Calculate P(word | Ham) with Laplace smoothing
-            p_word_ham = (HAM_VOCAB.get(word, 0) + 1) / (total_ham_words + len(vocab))
-            log_ham_prob += math.log(p_word_ham)
+            p_word_spam = (SPAM_VOCAB.get(word, 0) + 1) / (total_spam + vocab_size)
+            log_spam += math.log(p_word_spam)
+            p_word_ham = (HAM_VOCAB.get(word, 0) + 1) / (total_ham + vocab_size)
+            log_ham += math.log(p_word_ham)
 
-    # Return a score based on the difference.
-    score = (log_spam_prob - log_ham_prob) * 3.0
-    
-    # Cap negative score (Ham) so it doesn't override strong spam signals
-    # Max deduction is now -5 points (previously -10)
-    if score < 0:
-        return max(score, -5.0)
-    
-    # Cap positive score (Spam)
-    return min(score, 35.0)
+    score = (log_spam - log_ham) * 3.0
+    return max(-10.0, min(40.0, score))
 
-# ========= URL Analysis =========
 def _url_features(urls: List[str]) -> Tuple[bool, bool, bool, List[str]]:
-    """
-    Returns (tracking_hit, bad_tld_hit, long_query_hit, shortener_urls)
-    """
-    tracking_hit = False
-    bad_tld_hit = False
-    long_query_hit = False
-    shortener_urls = []
-    
+    tracking_hit = False; bad_tld_hit = False; long_query_hit = False; shortener_urls = []
     for u in urls:
         try:
             parsed = urlparse(u)
             host = parsed.netloc.lower()
-            
-            # Check tracking hosts
-            if any(hint in host for hint in TRACKING_HOST_HINTS):
-                tracking_hit = True
-            
-            # Check bad TLDs
-            extracted = _TLDX(u)
-            if extracted.suffix in SUSPICIOUS_TLDS:
-                bad_tld_hit = True
-            
-            # Check long query strings
-            if len(parsed.query) > 80:
-                long_query_hit = True
-            
-            # Check URL shorteners
-            if host in URL_SHORTENERS or any(short in host for short in URL_SHORTENERS):
-                shortener_urls.append(u)
-                
-        except Exception:
-            pass
-    
+            if any(hint in host for hint in ["click", "trk", "track", "r.", "l.", "links."]): tracking_hit = True
+            if _TLDX(u).suffix in SUSPICIOUS_TLDS: bad_tld_hit = True
+            if len(parsed.query) > 80: long_query_hit = True
+            if host in URL_SHORTENERS: shortener_urls.append(u)
+        except Exception: pass
     return tracking_hit, bad_tld_hit, long_query_hit, shortener_urls
 
-# ========= Google Safe Browsing Integration =========
 async def check_urls_against_safe_browsing(urls: List[str]) -> Tuple[bool, List[str]]:
-    """
-    Check URLs against Google Safe Browsing API
-    Returns (has_malicious, malicious_urls)
-    """
-    if not GOOGLE_SAFE_BROWSING_API_KEY or not urls:
-        return False, []
-    
+    if not GOOGLE_SAFE_BROWSING_API_KEY or not urls: return False, []
     try:
         api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SAFE_BROWSING_API_KEY}"
-        
         payload = {
-            "client": {
-                "clientId": "spamscore",
-                "clientVersion": "1.0.0"
-            },
+            "client": {"clientId": "spamscore", "clientVersion": "1.0.0"},
             "threatInfo": {
-                "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
-                "platformTypes": ["ANY_PLATFORM"],
-                "threatEntryTypes": ["URL"],
-                "threatEntries": [{"url": url} for url in urls[:10]]  # Limit to 10 URLs
+                "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING"], "platformTypes": ["ANY_PLATFORM"],
+                "threatEntryTypes": ["URL"], "threatEntries": [{"url": url} for url in urls[:10]]
             }
         }
-        
         async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.post(api_url, json=payload)
+            r = await client.post(api_url, json=payload)
+            if r.status_code == 200 and r.json().get("matches"):
+                return True, [m.get("threat", {}).get("url") for m in r.json().get("matches")]
+        return False, []
+    except Exception: return False, []
+
+def check_domain_spamhaus_dbl(domain: str) -> bool:
+    """
+    Check if domain is listed in Spamhaus DBL (Domain Block List).
+    Returns True if domain is listed (bad reputation).
+    """
+    if not domain or '.' not in domain:
+        return False
+    try:
+        # Query Spamhaus DBL via DNS
+        query = f"{domain}.dbl.spamhaus.org"
+        socket.gethostbyname(query)
+        return True  # If resolution succeeds, domain is listed
+    except socket.gaierror:
+        return False  # Not listed
+    except Exception:
+        return False
+
+async def check_url_urlhaus(url: str) -> bool:
+    """
+    Check if URL is listed in URLhaus (malicious URL database).
+    Returns True if URL is malicious.
+    """
+    if not url:
+        return False
+    try:
+        api_url = "https://urlhaus-api.abuse.ch/v1/url/"
+        payload = {"url": url}
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.post(api_url, data=payload)
+            if r.status_code == 200:
+                data = r.json()
+                # URLhaus returns query_status: "ok" if URL is in their database
+                return data.get("query_status") == "ok"
+        return False
+    except Exception:
+        return False
+
+# ==============================================================================
+# FORWARD DETECTION (Improved)
+# ==============================================================================
+
+def detect_forwarded_original_sender(body: str) -> tuple[str, str] | None:
+    """
+    Attempts to find the original sender in a forwarded email.
+    Returns: (email, display_name) or None
+    """
+    if not body: return None
+    clean = body.replace("*", "").strip()
+
+    # FIRST: Try to extract email AND display name from angle brackets in "From:" line
+    # This handles: "From: Mixcloud <noreply@mixcloudmail.com>" format
+    angle_bracket_pattern = r'From:\s*([^<\n]*?)\s*<([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>'
+    angle_match = re.search(angle_bracket_pattern, clean, re.IGNORECASE | re.MULTILINE)
+    if angle_match:
+        display_name = angle_match.group(1).strip()
+        email = angle_match.group(2).lower().strip()
+        if email and '@' in email:
+            return (email, display_name)
+
+    # Strip HTML tags AND email quote markers (>, >>, etc.) for better pattern matching
+    html_stripped = re.sub(r'<[^>]+>', ' ', clean)
+    quote_stripped = re.sub(r'^[>\s]+', '', html_stripped, flags=re.MULTILINE)  # Remove > prefixes from lines
+
+    # 1. Strict Patterns (Best quality) - handles various formats (no display name)
+    patterns = [
+        r'From:.*?\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
+        r'Sender:\s*<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?',
+        r'\bFrom:\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        r'>+\s*From:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',  # Quoted forward (> From:)
+    ]
+
+    # Try patterns on quote-stripped version first (best for plain text forwards)
+    for pattern in patterns:
+        match = re.search(pattern, quote_stripped, re.IGNORECASE)
+        if match:
+            email = match.group(1).lower().strip()
+            if email and '@' in email: return (email, "")
+
+    # Try patterns on HTML-stripped version
+    for pattern in patterns:
+        match = re.search(pattern, html_stripped, re.IGNORECASE)
+        if match:
+            email = match.group(1).lower().strip()
+            if email and '@' in email: return (email, "")
+
+    # Try patterns on original body as final fallback
+    for pattern in patterns:
+        match = re.search(pattern, clean, re.IGNORECASE | re.DOTALL)
+        if match:
+            email = match.group(1).lower().strip()
+            if email and '@' in email: return (email, "")
+
+    # 2. Loose Fallback: Find ANY email in the first 2000 chars (no display name)
+    header_chunk = quote_stripped[:2000]
+    emails = re.findall(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', header_chunk)
+
+    for email in emails:
+        email = email.lower()
+        # Exclude common system emails and scanning system
+        if any(x in email for x in ["support@", "bounce", "daemon", "scan@", "noreply@"]):
+            continue
+        return (email, "")
+    return None
+
+def detect_marketing_email(body: str, subject: str) -> List[Tuple[str, int]]:
+    contribs = []
+    combined = f"{subject} {body}".lower()
+    
+    if 'list-unsubscribe:' in combined:
+        contribs.append(("forwarded_unsubscribe_header", 40))
+    
+    if "unsubscribe" in combined:
+        if any(x in combined for x in ["click here", "preferences", "opt-out", "browser", "subscription", "manage"]):
+            contribs.append(("marketing_unsubscribe_link_in_body", 40))
             
-            if response.status_code == 200:
-                data = response.json()
-                matches = data.get("matches", [])
-                if matches:
-                    malicious_urls = [match.get("threat", {}).get("url") for match in matches]
-                    return True, malicious_urls
+    if re.search(r'precedence\s*:\s*bulk', combined):
+        contribs.append(("precedence_bulk_header", 20))
+    
+    if re.search(r'\d{1,3}%\s*off', combined):
+        contribs.append(("discount_offer", 15))
         
-        return False, []
+    if re.search(r'act fast|limited time|hurry|expires', combined):
+        contribs.append(("urgency_tactics", 20))
         
-    except Exception as e:
-        print(f"Safe Browsing API error: {e}")
-        return False, []
+    return contribs
 
-# ========= Action Advice =========
-def get_action_advice(verdict: str, category: str) -> Dict:
-    """Returns user-friendly action advice"""
-    advice_map = {
-        ("block", "phishing"): {
-            "emoji": "🚫",
-            "title": "BLOCK THIS EMAIL - Likely Phishing Attack",
-            "subtitle": "This email shows strong signs of a phishing attempt",
-            "steps": [
-                "DO NOT click any links or download attachments",
-                "DO NOT reply or provide any information",
-                "Delete this email immediately",
-                "If it claims to be from a company you use, visit their website directly (don't use links in the email)",
-                "Consider reporting this to your IT security team or email provider"
-            ]
-        },
-        ("block", "business_spam"): {
-            "emoji": "🗑️",
-            "title": "BLOCK THIS EMAIL - Unsolicited Business Spam",
-            "subtitle": "This appears to be cold outreach/B2B spam",
-            "steps": [
-                "Delete or mark as spam",
-                "These emails rarely contain value and waste your time",
-                "Consider unsubscribing if there's a legitimate option",
-                "Set up filters to block future emails from this sender"
-            ]
-        },
-        ("block", "junk"): {
-            "emoji": "🗑️",
-            "title": "BLOCK THIS EMAIL - Junk/Marketing",
-            "subtitle": "Appears to be unwanted marketing or junk mail",
-            "steps": [
-                "Delete or move to spam folder",
-                "Unsubscribe if you don't remember signing up",
-                "These emails clutter your inbox with no value"
-            ]
-        },
-        ("block", "marketing"): {
-            "emoji": "🗑️",
-            "title": "BLOCK THIS EMAIL - Promotional",
-            "subtitle": "Aggressive marketing detected",
-            "steps": [
-                "Delete or move to spam folder",
-                "Unsubscribe if you don't remember signing up",
-                "These emails clutter your inbox with no value"
-            ]
-        },
-        ("block", "suspicious"): {
-            "emoji": "⚠️",
-            "title": "BLOCK THIS EMAIL - Suspicious Content",
-            "subtitle": "Multiple red flags detected",
-            "steps": [
-                "Be very cautious with this email",
-                "Don't click links or download files",
-                "Verify sender through another channel before responding",
-                "When in doubt, delete it"
-            ]
-        },
-        ("caution", "marketing"): {
-            "emoji": "⚠️",
-            "title": "CAUTION - Promotional Email",
-            "subtitle": "Appears to be marketing, use your judgment",
-            "steps": [
-                "Verify you signed up for emails from this sender",
-                "Check for unsubscribe options at the bottom",
-                "Be cautious clicking links",
-                "Consider if this is a company you trust"
-            ]
-        },
-        ("caution", "suspicious"): {
-            "emoji": "👀",
-            "title": "CAUTION - Review Carefully",
-            "subtitle": "Some concerning elements detected",
-            "steps": [
-                "Read carefully before taking any action",
-                "Verify sender identity if making any decisions",
-                "Hover over links before clicking to see where they go",
-                "Trust your instincts - if something feels off, it probably is"
-            ]
-        },
-        ("safe", "legitimate"): {
-            "emoji": "✅",
-            "title": "Looks Safe",
-            "subtitle": "No major red flags detected",
-            "steps": [
-                "This email appears legitimate",
-                "Still practice good email hygiene",
-                "Verify sender if email requests sensitive info",
-                "When in doubt, contact the sender through official channels"
-            ]
+# 🔴 RESTORED FUNCTION
+def analyze_email_headers(body: str) -> List[Tuple[str, int]]:
+    contributions = []
+    if not body: return []
+    body_lower = body.lower()
+    
+    if re.search(r'scl:\s*([5-9]|1[0-9])', body_lower):
+        contributions.append(("microsoft_marked_as_spam", 25))
+    if re.search(r'sfv:\s*spm', body_lower):
+        contributions.append(("spam_filter_verdict_spam", 25))
+    if re.search(r'cat:\s*spm', body_lower):
+        contributions.append(("categorized_as_spam", 20))
+    if re.search(r'rf:\s*junkemail', body_lower):
+        contributions.append(("delivered_to_junk_folder", 20))
+    if re.search(r'x-forefront-antispam-report:.*spm', body_lower):
+        contributions.append(("forefront_spam_detection", 15))
+    
+    spam_score_match = re.search(r'x-spam-score:\s*([\d.]+)', body_lower)
+    if spam_score_match:
+        spam_score = float(spam_score_match.group(1))
+        if spam_score >= 5.0:
+            contributions.append((f"spamassassin_score:{spam_score}", 30))
+        elif spam_score >= 3.0:
+            contributions.append((f"spamassassin_score:{spam_score}", 15))
+            
+    return contributions
+
+# ========= Sender Name vs Email Mismatch Detection =========
+def check_sender_name_email_mismatch(sender: str, body: str) -> List[Tuple[str, int]]:
+    """
+    Detect when sender name doesn't match email address (common in spam)
+    Example: "John Smith <randomshop123@gmail.com>"
+    """
+    contributions = []
+
+    # Extract display name if present
+    name_match = re.search(r'^([^<]+)<([^>]+)>$', sender.strip())
+    if not name_match:
+        return []
+
+    display_name = name_match.group(1).strip().lower()
+    email_addr = name_match.group(2).strip().lower()
+    sender_dom = _domain_of(email_addr)
+
+    # Skip if no real display name
+    if not display_name or '@' in display_name:
+        return []
+
+    # Check if name components are in email
+    name_parts = re.findall(r'\w+', display_name)
+    email_parts = re.findall(r'\w+', email_addr.split('@')[0])
+
+    # Check for matches
+    has_match = any(part in email_parts for part in name_parts if len(part) > 2)
+
+    if not has_match and sender_dom in FREE_EMAIL_SENDERS:
+        contributions.append(("sender_name_email_mismatch_free_provider", 8))
+    elif not has_match:
+        contributions.append(("sender_name_email_mismatch", 5))
+
+    return contributions
+
+# ==============================================================================
+# 3-LAYER REPUTATION SCORING SYSTEM
+# ==============================================================================
+
+async def score_email_v3(
+    sender: str,
+    subject: str,
+    body: str,
+    urls: List[str],
+    spf_result: str,
+    dkim_result: str,
+    dmarc_result: str,
+    is_whitelisted: bool = False,
+    recipient: str = "",
+    display_name: str = ""
+) -> Dict:
+    """
+    3-Layer reputation-based scoring:
+    Layer A (Hard-bad): Blocklists, malicious URLs, auth failures → can dominate
+    Layer B (Hard-good): Clean reputation → can neutralize soft signals
+    Layer C (Soft/content): Keywords, formatting → capped at +25
+
+    Conservative approach: Require multiple signals to block, avoid false positives.
+    """
+    score = 0
+    reasons = []
+
+    # ========== EARLY EXIT: INTERNAL EMAILS ==========
+    # If sender and recipient are same domain (internal email), auto-safe
+    sender_domain = sender.split('@')[-1] if '@' in sender else ""
+    recipient_domain = recipient.split('@')[-1] if '@' in recipient else ""
+
+    if sender_domain and recipient_domain and sender_domain == recipient_domain:
+        print(f"   DEBUG: Internal email detected ({sender_domain}), auto-safe")
+        return {
+            "score": 0,
+            "verdict": "safe",
+            "category": "internal",
+            "reasons": [("internal_email", 0)]
         }
-    }
-    
-    # Default fallback
-    default = {
-        "emoji": "❓",
-        "title": "Review This Email",
-        "subtitle": "Unable to determine safety level",
-        "steps": [
-            "Review carefully before taking action",
-            "Verify sender through official channels",
-            "Don't provide sensitive information"
-        ]
-    }
-    
-    return advice_map.get((verdict, category), default)
 
-# ========= MAIN CATEGORIZATION ENGINE =========
-async def categorize_email(sender: str, subject: str, body: str, user_id: Optional[str] = None) -> Dict:
-    """
-    Main analysis engine - returns spam score and categorization
-    """
+    # ========== LAYER A: HARD-BAD (can dominate) ==========
+
+    # Skip reputation checks for unknown/placeholder senders
+    is_placeholder = sender == "unknown_sender_hidden@scan.system"
+
+    # Check sender domain against Spamhaus DBL (DISABLED - causing false positives from Vercel IPs)
+    # Spamhaus blocks queries from datacenter/cloud IPs, causing legitimate domains to be flagged
+    # if sender_domain and not is_placeholder:
+    #     is_dbl_listed = check_domain_spamhaus_dbl(sender_domain)
+    #     print(f"   DEBUG: Spamhaus DBL check for {sender_domain}: {is_dbl_listed}")
+    #     if is_dbl_listed:
+    #         score += 70
+    #         reasons.append(("spamhaus_dbl_listed", 70))
+    is_dbl_listed = False  # Disabled for now
+
+    # Check URLs against URLhaus (DISABLED - requires auth, getting 401)
+    # urlhaus_hit = False
+    # for url in urls[:5]:  # Check first 5 URLs
+    #     if await check_url_urlhaus(url):
+    #         urlhaus_hit = True
+    #         break
+    # if urlhaus_hit:
+    #     score += 60
+    #     reasons.append(("urlhaus_malicious", 60))
+    urlhaus_hit = False  # Disabled for now
+
+    # Check URLs against Safe Browsing
+    has_malicious, malicious_urls = await check_urls_against_safe_browsing(urls)
+    if has_malicious:
+        score += 60
+        reasons.append(("safe_browsing_malicious", 60))
+
+    # Authentication failures
+    spf_fail = spf_result.lower() not in ["pass", ""]
+    dkim_fail = dkim_result.lower() not in ["pass", ""]
+    dmarc_fail = dmarc_result.lower() not in ["pass", ""]
+
+    if dmarc_fail and spf_fail:
+        score += 35
+        reasons.append(("dmarc_spf_fail", 35))
+    elif dkim_fail and sender_domain:
+        # Check if domain is new/unknown (simple heuristic: free email providers)
+        if sender_domain in ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com"]:
+            score += 20
+            reasons.append(("dkim_fail_new_domain", 20))
+
+    # Early exit for hard-bad
+    if score >= 75:
+        return {
+            "score": min(score, 100),
+            "verdict": "block",
+            "category": "malicious",
+            "reasons": reasons
+        }
+
+    # ========== LAYER B: HARD-GOOD (dampeners & overrides) ==========
+
+    spf_pass = spf_result.lower() == "pass"
+    dkim_pass = dkim_result.lower() == "pass"
+    dmarc_pass = dmarc_result.lower() == "pass"
+
+    if spf_pass:
+        score -= 8
+        reasons.append(("spf_pass", -8))
+    if dkim_pass:
+        score -= 10
+        reasons.append(("dkim_pass", -10))
+    if dmarc_pass:
+        score -= 10
+        reasons.append(("dmarc_pass", -10))
+
+    # Clean bill of health: all rep checks clean AND low content score → cap at 20
+    # This protects legitimate transactional emails, but doesn't protect marketing
+    # Skip for placeholder senders since we can't verify reputation
+    # DISABLED - was causing marketing emails to bypass content scoring
+    # if not is_placeholder:
+    #     all_rep_clean = (not urlhaus_hit and not has_malicious and
+    #                      not check_domain_spamhaus_dbl(sender_domain))
+    #     if all_rep_clean and spf_pass and dkim_pass:
+    #         score = min(score, 20)
+    #         reasons.append(("clean_bill_of_health", 0))
+
+    # Whitelist override → cap at 10
+    if is_whitelisted:
+        score = min(score, 10)
+        reasons.append(("whitelisted_sender", 0))
+
+    # ========== LAYER C: SOFT/CONTENT (marketing detection) ==========
+
+    soft_score = 0
+    combined = f"{subject} {body}".lower()
+
+    # Unsubscribe detection (strong marketing signal) +20
+    unsubscribe_patterns = ["unsubscribe", "opt out", "opt-out", "manage preferences",
+                           "update email preferences", "email preferences"]
+    if any(pattern in combined for pattern in unsubscribe_patterns):
+        soft_score += 20
+        reasons.append(("unsubscribe_link", 20))
+
+    # "View in browser" pattern (marketing emails) +15
+    view_browser_patterns = ["view this email in your browser", "view in browser",
+                             "view online", "having trouble viewing"]
+    if any(pattern in combined for pattern in view_browser_patterns):
+        soft_score += 15
+        reasons.append(("view_in_browser", 15))
+
+    # Tracking URLs (utm parameters, marketing tracking) +12
+    tracking_indicators = ["utm_source", "utm_campaign", "utm_medium", "utm_content",
+                          "email_id", "track=", "tracking=", "campaign_id"]
+    tracking_count = sum(1 for url in urls if any(t in url.lower() for t in tracking_indicators))
+    if tracking_count >= 3:
+        soft_score += 12
+        reasons.append(("tracking_urls", 12))
+
+    # Marketing language +15
+    marketing_keywords = ["exclusive", "invite only", "limited time", "don't miss",
+                         "before you go", "sign up now", "join now", "get started",
+                         "claim your", "special offer", "act now"]
+    marketing_hits = sum(1 for kw in marketing_keywords if kw in combined)
+    if marketing_hits >= 2:
+        marketing_score = min(marketing_hits * 5, 15)
+        soft_score += marketing_score
+        reasons.append(("marketing_language", marketing_score))
+
+    # Urgency keywords +10
+    urgency_keywords = ["urgent", "immediate", "expires", "deadline", "hurry",
+                       "ending soon", "last chance", "final notice"]
+    urgency_hits = sum(1 for kw in urgency_keywords if kw in combined)
+    if urgency_hits > 0:
+        urgency_score = min(urgency_hits * 5, 10)
+        soft_score += urgency_score
+        reasons.append(("urgency_language", urgency_score))
+
+    # High link density (scaled by count) +8 to +20
+    if len(urls) > 20:
+        soft_score += 20
+        reasons.append(("excessive_links", 20))
+    elif len(urls) > 10:
+        soft_score += 15
+        reasons.append(("many_links", 15))
+    elif len(urls) > 5:
+        soft_score += 8
+        reasons.append(("high_link_density", 8))
+
+    # URL shorteners +8
+    shorteners = ["bit.ly", "tinyurl", "goo.gl", "ow.ly", "short.link"]
+    has_shortener = any(s in url for url in urls for s in shorteners)
+    if has_shortener:
+        soft_score += 8
+        reasons.append(("url_shortener", 8))
+
+    # Suspicious TLDs (common in phishing) +25
+    suspicious_tlds = [".tk", ".ml", ".ga", ".cf", ".gq", ".biz.ua", ".ru.com",
+                      ".click", ".loan", ".download", ".racing", ".top", ".work"]
+    if sender_domain and any(sender_domain.endswith(tld) for tld in suspicious_tlds):
+        soft_score += 25
+        reasons.append(("suspicious_tld", 25))
+
+    # Prize/scam language (phishing patterns) +25
+    scam_keywords = ["congratulations", "you've been selected", "you won", "claim your free",
+                    "free gift", "you've won", "winner", "claim now", "get your free",
+                    "you have been chosen", "selected winner"]
+    scam_hits = sum(1 for kw in scam_keywords if kw in combined)
+    if scam_hits > 0:
+        scam_score = min(scam_hits * 15, 25)
+        soft_score += scam_score
+        reasons.append(("scam_language", scam_score))
+
+    # Survey/prize scam patterns +15
+    survey_patterns = ["complete this survey", "take this survey", "answer these questions",
+                      "short survey", "quick survey", "survey about"]
+    if any(pattern in combined for pattern in survey_patterns):
+        soft_score += 15
+        reasons.append(("survey_scam", 15))
+
+    # Romance/dating scam patterns +30
+    romance_keywords = ["find love", "godly love", "christian singles", "meet singles",
+                       "dating", "soulmate", "perfect match", "lonely", "companionship",
+                       "romance", "relationship", "find your match"]
+    romance_hits = sum(1 for kw in romance_keywords if kw in combined)
+    if romance_hits > 0:
+        romance_score = min(romance_hits * 15, 30)
+        soft_score += romance_score
+        reasons.append(("romance_scam", romance_score))
+
+    # Hidden text obfuscation (soft hyphens, zero-width chars) +20
+    obfuscation_indicators = ["\u00ad", "\u200b", "\u200c", "\u200d", "\ufeff"]  # soft hyphen, zero-width chars
+    if any(char in subject + body for char in obfuscation_indicators):
+        soft_score += 20
+        reasons.append(("text_obfuscation", 20))
+
+    # Display name domain mismatch (phishing tactic) +35
+    # E.g., Display: "americanhomewarranty.net" but actual sender: "scammer@oeveward.com"
+    if display_name and sender_domain:
+        # Extract domain patterns from display name (look for domain-like strings)
+        display_domains = re.findall(r'\b([a-zA-Z0-9-]+\.(?:com|net|org|edu|gov|co|io|ai|app))\b', display_name.lower())
+        if display_domains:
+            # Check if any display domain doesn't match actual sender domain
+            if not any(d in sender_domain or sender_domain in d for d in display_domains):
+                soft_score += 35
+                reasons.append(("display_name_mismatch", 35))
+
+    # Gibberish sender address (random characters) +30
+    # E.g., "vjurmfjwaksdy@oeveward.com" - common in scam emails
+    if sender and '@' in sender and sender != UNKNOWN_SENDER_PLACEHOLDER:
+        username = sender.split('@')[0].lower()
+        # Check for gibberish: long username (>10 chars) with low vowel ratio
+        if len(username) > 10:
+            vowels = sum(1 for c in username if c in 'aeiou')
+            vowel_ratio = vowels / len(username)
+            # Gibberish has very low vowel ratio (<0.25) or very high (>0.6)
+            if vowel_ratio < 0.25 or vowel_ratio > 0.6:
+                # Also check for repetitive patterns (additional signal)
+                unique_chars = len(set(username))
+                if unique_chars > 8:  # Truly random, not just "aaaaaaa"
+                    soft_score += 30
+                    reasons.append(("gibberish_sender", 30))
+
+    # Cap soft/content at +80 (raised to catch phishing scams)
+    soft_score = min(soft_score, 80)
+    score += soft_score
+
+    # Final bounds
+    score = max(0, min(score, 100))
+
+    # Determine verdict - Balanced thresholds
+    # 0-34: Safe (transactional, legitimate)
+    # 35-69: Caution (marketing, suspicious patterns)
+    # 70+: Block (clear spam, multiple strong signals)
+    if score >= 70:
+        verdict = "block"
+        category = "spam"
+    elif score >= 35:
+        verdict = "caution"
+        category = "suspicious"
+    else:
+        verdict = "safe"
+        category = "legitimate"
+
+    return {
+        "score": score,
+        "verdict": verdict,
+        "category": category,
+        "reasons": reasons
+    }
+
+# ==============================================================================
+# CATEGORIZATION ENGINE (Legacy - to be migrated)
+# ==============================================================================
+
+async def categorize_email(sender: str, subject: str, body: str, user_id: Optional[str] = None, force_neutral: bool = False) -> Dict:
     contributions = []
     flags = {}
     
-    # Check whitelist first
-    is_wl = False
-    wl_reason = ""
-    if user_id:
+    is_wl, wl_reason, is_bl, bl_reason = False, "", False, ""
+    if user_id and not force_neutral:
         is_wl, wl_reason = check_whitelist(user_id, sender)
-        if is_wl:
-            flags["whitelisted"] = True
-            flags["whitelist_reason"] = wl_reason
-    
-    # Check blocklist
-    is_bl = False
-    bl_reason = ""
-    if user_id:
         is_bl, bl_reason = check_blocklist(user_id, sender)
-        if is_bl:
-            if is_wl:
-                # CONFLICT RESOLUTION: Whitelist wins, remove from blocklist
-                sender_email = extract_email(sender)
-                sender_domain = _domain_of(sender_email)
-                if is_blocked(user_id, sender_email, 'email'):
-                    remove_from_blocklist(user_id, sender_email, 'email')
-                if is_blocked(user_id, sender_domain, 'domain'):
-                    remove_from_blocklist(user_id, sender_domain, 'domain')
-                is_bl = False
-                bl_reason = ""
-            else:
-                # Blocklist hit - IMMEDIATE RETURN
-                return {
-                    "score": 100,
-                    "verdict": "block",
-                    "category": "blocked_sender",
-                    "reasons": [bl_reason],
-                    "simple_reasons": [{"explanation": get_simple_explanation(bl_reason), "severity": "high"}],
-                    "flags": {"blocked": True},
-                    "urls_found": [],
-                    "shortener_urls": [],
-                    "whitelisted": False,
-                    "blocked": True,
-                    "detailed_reasons": []
-                }
-    
-    # Extract features
-    sender_dom = _domain_of(sender)
-    subject_lower = (subject or "").lower()
-    body_lower = (body or "").lower()
-    combined = f"{subject_lower} {body_lower}"
-    urls = extract_urls(body)
-    
-    # Trusted domain bonus check
-    is_trusted_domain = False
-    for trusted in TRUSTED_DOMAINS:
-        if trusted in sender_dom:
-            is_trusted_domain = True
-            break
-    
-    # 1. Bayesian Score (Skip for trusted domains)
-    if not is_trusted_domain:
-        bayesian_score = calculate_bayesian_score(combined)
-        if bayesian_score > 5: # Only add if significant spam signal
-            contributions.append(("bayesian_spam_content", bayesian_score))
-        elif bayesian_score < -2: # Weak bonus for ham
-            contributions.append(("bayesian_ham_bonus", bayesian_score))
-    
-    # 2. URL Analysis
-    tracking_hit, bad_tld_hit, long_query_hit, shortener_urls = _url_features(urls)
-    
-    # Google Safe Browsing check
-    has_malicious, malicious_urls = await check_urls_against_safe_browsing(urls)
-    if has_malicious:
-        contributions.append(("malicious_url_detected", 100))
-        flags["malicious_urls"] = malicious_urls
-    
-    # 3. Link Density Check (New)
-    # If short email (<100 words) has >3 links -> Spam
-    word_count = len(re.findall(r'\w+', body_lower))
-    if word_count < 100 and len(urls) > 3:
-        contributions.append(("high_link_density", 15))
+        if is_wl: flags["whitelisted"] = True
+        elif is_bl:
+            return {"score": 100, "verdict": "block", "category": "blocked", "reasons": [bl_reason], "simple_reasons": [{"explanation": "Sender is Blocked", "severity": "high"}], "detailed_reasons": [{"explanation": "Sender is in your blocklist", "points": 100}], "blocked": True}
 
-    # Header-based detection for forwarded emails
-    header_contributions = analyze_email_headers(body)
-    if header_contributions:
-        contributions.extend(header_contributions)
+    sender_dom = sender.split('@')[-1].lower() if '@' in sender else ""
+    combined = f"{subject} {body}".lower()
+    urls = extract_urls(body)
+    is_trusted_domain = any(t in sender_dom for t in TRUSTED_DOMAINS)
     
-    # Subject line pattern analysis
-    subject_contributions = analyze_suspicious_subject(subject, sender)
-    if subject_contributions:
-        contributions.extend(subject_contributions)
+    if sender == UNKNOWN_SENDER_PLACEHOLDER:
+        contributions.append(("unverified_sender_source", 5))
+        
+    if not is_trusted_domain or force_neutral:
+        bayesian_score = calculate_bayesian_score(combined)
+        if bayesian_score > 5: contributions.append(("bayesian_spam_content", bayesian_score))
+        elif bayesian_score < -2 and not force_neutral: contributions.append(("bayesian_ham_bonus", bayesian_score))
+            
+    tracking_hit, bad_tld_hit, long_query_hit, shortener_urls = _url_features(urls)
+    has_malicious, malicious_urls = await check_urls_against_safe_browsing(urls)
     
-    # Sender name/email mismatch
-    mismatch_contributions = check_sender_name_email_mismatch(sender, body)
-    if mismatch_contributions:
-        contributions.extend(mismatch_contributions)
+    if has_malicious: contributions.append(("malicious_url_detected", 100))
+    if tracking_hit: contributions.append(("tracking_urls_detected", 10))
+    if bad_tld_hit: contributions.append(("suspicious_tld_detected", 20))
+    if long_query_hit: contributions.append(("long_query_string_urls", 10))
+    if shortener_urls: contributions.append(("url_shorteners_detected", 15))
     
-    # Phishing indicators
-    phishing_matches = sum(1 for p in PHISHING_WORDS if re.search(p, combined, re.I))
-    if phishing_matches >= 2:
-        contributions.append(("phishing_language", 40))
-    elif phishing_matches == 1:
-        contributions.append(("potential_phishing_language", 15))
-    
-    # Business spam indicators
+    if len(urls) > 5: contributions.append(("high_link_density", 15))
+        
+    header_contribs = analyze_email_headers(body)
+    if header_contribs: contributions.extend(header_contribs)
+        
+    if _is_all_caps(subject): contributions.append(("all_caps_subject", 10))
+    if re.search(r'\b(urgent|verify|action)\b', subject.lower()): contributions.append(("urgency_pressure", 15))
+        
+    mismatch_contribs = check_sender_name_email_mismatch(sender, body)
+    if mismatch_contribs: contributions.extend(mismatch_contribs)
+        
+    phishing_matches = sum(1 for p in PHISHING_WORDS if re.search(p, combined))
+    if phishing_matches >= 2: contributions.append(("phishing_language", 40))
+    elif phishing_matches == 1: contributions.append(("potential_phishing_language", 15))
+        
     biz_score = 0
     for pattern, weight in BUSINESS_SPAM_WEIGHTS.items():
-        if re.search(pattern, combined, re.I):
-            biz_score += weight
-    
+        if re.search(pattern, combined): biz_score += weight
     is_free_email = sender_dom in FREE_EMAIL_SENDERS
-    if biz_score >= 20:
-        contributions.append(("business_spam", biz_score))
-        if is_free_email:
-            contributions.append(("free_email_cold_outreach_kicker", 15))
-    elif biz_score >= 10 and is_free_email and not is_trusted_domain:
-        contributions.append(("business_spam", biz_score))
-        contributions.append(("free_email_cold_outreach_kicker", 10))
+    if biz_score >= 20: contributions.append(("business_spam", biz_score))
+    elif biz_score >= 10: contributions.append(("business_spam", biz_score))
+    if is_free_email and biz_score > 0: contributions.append(("free_email_business_content", 20))
         
-    # Free Email + Business Content = High Risk
-    if is_free_email and biz_score > 0:
-        contributions.append(("free_email_business_content", 20))
-    
-    # Marketing/junk indicators
-    junk_matches = sum(1 for j in JUNK_WORDS if re.search(j, combined, re.I))
-    if junk_matches >= 3:
-        penalty = 20 if is_trusted_domain else 30
-        contributions.append(("heavy_marketing_language", penalty))
-    elif junk_matches >= 2:
-        penalty = 8 if is_trusted_domain else 15
-        contributions.append(("marketing_language", penalty))
-    
-    # Marketing Email Detection (Always run to catch forwarded stuff)
-    marketing_contributions = detect_marketing_email(body, subject, sender)
-    if marketing_contributions:
-        contributions.extend(marketing_contributions)
-    
-    # Poor grammar indicators
-    grammar_matches = sum(1 for g in POOR_GRAMMAR_INDICATORS if re.search(g, combined, re.I))
-    if grammar_matches >= 1:
-        contributions.append(("poor_grammar", 10))
-    
-    # Tracking/suspicious URLs
-    if tracking_hit:
-        contributions.append(("tracking_urls_detected", 10))
-    if bad_tld_hit:
-        contributions.append(("suspicious_tld_detected", 20))
-    if long_query_hit:
-        contributions.append(("long_query_string_urls", 10))
-    if shortener_urls:
-        contributions.append(("url_shorteners_detected", 15))
-    
-    # Subject analysis
-    if _is_all_caps(subject):
-        contributions.append(("all_caps_subject", 10))
-    if re.search(r"re:|fwd:", subject_lower) and not re.search(r"re:|fwd:", body_lower[:200]):
-        contributions.append(("fake_reply_subject", 10)) # Increased from 5
-    
-    # Urgency/pressure tactics
-    if re.search(r"\burgent\b|\basap\b|\bimmediate\b|\bnow\b.*action", combined, re.I):
-        contributions.append(("urgency_pressure", 15))
-    
-    # Generic greetings
-    if re.search(r"dear (customer|user|client|member|sir|madam)\b", combined, re.I):
-        penalty = 5 if is_trusted_domain else 10
-        contributions.append(("generic_greeting", penalty))
-    
-    # Reply-To mismatch
-    reply_to_match = RE_REPLYTO.search(body)
-    if reply_to_match:
-        reply_to = reply_to_match.group(1).lower()
-        if _domain_of(reply_to) != sender_dom:
-            contributions.append((f"reply_to_mismatch:{reply_to}", 12))
-    
-    # Calculate final score
+    marketing_contribs = detect_marketing_email(body, subject)
+    if marketing_contribs: contributions.extend(marketing_contribs)
+        
     score = sum(c[1] for c in contributions)
     
-    # Check for any spam signals (ignoring bonuses)
     spam_signals = [c for c in contributions if c[1] > 0]
-    has_spam_signal = len(spam_signals) > 0
-    
-    # Disable Trusted Domain Bonus if spam signals exist
-    if is_trusted_domain:
-        if has_spam_signal:
-            contributions.append(("trusted_domain_bonus_disabled_by_content", 0))
-        elif score < 10:
+    if is_trusted_domain and not force_neutral:
+        if not spam_signals:
+            score = max(0, score - 15)
+            contributions.append(("trusted_domain_bonus", -15))
+        elif score < 20:
             score = max(0, score - 10)
             contributions.append(("trusted_domain_bonus", -10))
-    
-    score = max(0, score)
-    
-    # Whitelist adjustment
-    if is_wl:
-        original_score = score
+            
+    if is_wl and not force_neutral:
         if score < 70:
-            score_reduction = min(score, 40)
-            score = max(0, score - score_reduction)
-            contributions.append((wl_reason, -score_reduction))
+            score = max(0, score - 50)
+            contributions.append((wl_reason, -50))
         else:
-            contributions.append((f"{wl_reason} (IGNORED: High Risk Content)", 0))
+            contributions.append((f"{wl_reason} (IGNORED - High Risk)", 0))
+            
+    score = max(0, min(100, score))
     
-    # Verdict Logic
-    # Tightened: Any Marketing/Business Spam triggers Caution immediately
-    has_marketing = any("marketing" in c[0].lower() or "unsubscribe" in c[0].lower() or 
-                                "precedence" in c[0].lower() or "hubspot" in c[0].lower() or
-                                "tracking" in c[0].lower() or "platform" in c[0].lower() for c in contributions if c[1] > 0)
+    has_marketing = any("marketing" in c[0] for c in spam_signals)
     has_biz = any("business" in c[0] for c in spam_signals)
     
     if score >= MIN_BLOCK_SCORE:
         verdict = "block"
-        if phishing_matches >= 1 or has_malicious:
-            category = "phishing"
-        elif biz_score >= 20 or (biz_score >= 10 and is_free_email):
-            category = "business_spam"
-        elif junk_matches >= 2:
-            category = "junk"
-        elif has_marketing:
-            category = "marketing"
-        else:
-            category = "suspicious"
-    elif score >= 10 or has_marketing or has_biz:
+        if any("phish" in c[0] for c in spam_signals): category = "phishing"
+        elif has_marketing: category = "marketing"
+        elif has_biz: category = "business_spam"
+        else: category = "suspicious"
+    elif score >= 10 or has_marketing:
         verdict = "caution"
         category = "marketing" if has_marketing else "suspicious"
     else:
         verdict = "safe"
         category = "legitimate"
-    
-    simple_reasons = [{"explanation": get_simple_explanation(r), "severity": "high" if c > 15 else "medium" if c > 5 else "low"} for r, c in contributions if c > 0]
-    detailed_reasons = [{"explanation": get_simple_explanation(r), "points": c} for r, c in contributions if c != 0]
+        
+    simple_reasons = [{"explanation": get_simple_explanation(r[0]), "severity": "high" if r[1] > 20 else "medium"} for r in contributions if r[1] > 0]
+    detailed_reasons = [{"explanation": get_simple_explanation(r[0]), "points": int(r[1])} for r in contributions if r[1] != 0]
     
     return {
-        "score": score,
-        "verdict": verdict,
-        "category": category,
-        "confidence": min(1.0, max(MIN_CONFIDENCE, score / 60.0)),
-        "reasons": [r for r, c in contributions],
-        "simple_reasons": simple_reasons,
-        "detailed_reasons": detailed_reasons,
-        "flags": {
-            **flags,
-            "tracking_hit": tracking_hit,
-            "bad_tld_hit": bad_tld_hit,
-            "long_query_hit": long_query_hit,
-            "link_count": len(urls),
-            "is_trusted_domain": is_trusted_domain,
-        },
-        "urls_found": urls,
-        "shortener_urls": shortener_urls if shortener_urls else [],
-        "whitelisted": is_wl and score < 20,
-        "blocked": is_bl
+        "score": score, "verdict": verdict, "category": category,
+        "simple_reasons": simple_reasons, "detailed_reasons": detailed_reasons,
+        "whitelisted": is_wl, "blocked": False, "urls_found": urls
     }
 
-# ========= Mailgun Integration =========
-MG_KEY = os.getenv("MAILGUN_API_KEY", "")
-MG_DOMAIN = os.getenv("MAILGUN_DOMAIN", "")
-REPLY_FROM = os.getenv("REPLY_FROM", "scan@mg.techamped.com")
-
-async def send_report_via_mailgun(to_addr: str, subject: str, html_body: str, text_body: str) -> Tuple[bool, int, str]:
-    """
-    Return (ok, status_code, response_text)
-    """
-    if not (MG_KEY and MG_DOMAIN and to_addr):
-        return False, 503, "Mailgun not configured or missing recipient"
-    url = f"https://api.mailgun.net/v3/{MG_DOMAIN}/messages"
-    auth = ("api", MG_KEY)
-    data = {"from": REPLY_FROM, "to": to_addr, "subject": subject, "text": text_body, "html": html_body}
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(url, auth=auth, data=data)
-            return (200 <= r.status_code < 300), r.status_code, r.text
-    except Exception as e:
-        return False, 599, f"exception: {e}"
-
-# ========= Report Builders =========
-def get_educational_tip(reasons: List[str]) -> str:
-    tips = {
-        "phishing": "💡 Real companies NEVER ask you to verify passwords or accounts by email.",
-        "tracking": "💡 Hover over links (don't click!) to see where they really go.",
-        "bad_tld": "💡 Strange website endings like .xyz or .ru are common in scams.",
-        "urgency": "💡 Scammers create fake urgency to make you react without thinking.",
-        "generic": "💡 Legitimate companies use your name, not 'Dear Customer'.",
-    }
-    if any("phishing" in r.lower() or "verify" in r.lower() for r in reasons):
-        return tips["phishing"]
-    if any("tracking" in r.lower() for r in reasons):
-        return tips["tracking"]
-    if any("tld" in r.lower() for r in reasons):
-        return tips["bad_tld"]
-    if any("urgent" in r.lower() or "caps" in r.lower() for r in reasons):
-        return tips["urgency"]
-    if any("generic" in r.lower() or "dear customer" in r.lower() for r in reasons):
-        return tips["generic"]
-    return "💡 Always be skeptical of unexpected emails, especially those asking for action."
+# ==============================================================================
+# REPORT GENERATION
+# ==============================================================================
 
 def build_html_report(sender: str, subject: str, result: Dict, original_sender: str | None, evaluated_sender: str) -> str:
-    action = get_action_advice(result["verdict"], result["category"])
-    simple_reasons = result.get("simple_reasons", [])
-    detailed_reasons = result.get("detailed_reasons", [])
-
-    # Build reason blocks
-    reasons_html = ""
-    for r in simple_reasons:
-        severity_color = {"high": "#dc2626", "medium": "#ea580c", "low": "#ca8a04"}.get(r.get("severity", "low"), "#6b7280")
-        reasons_html += f'<div style="padding: 10px; margin: 8px 0; background: #f9fafb; border-left: 3px solid {severity_color}; border-radius: 4px;">{html.escape(r.get("explanation", ""))}</div>\n'
-
-    if not simple_reasons:
-        reasons_html = '<div style="padding: 10px; background: #f0fdf4; border-left: 3px solid #22c55e; border-radius: 4px;">No major red flags detected</div>'
-
-    # Build score breakdown
-    score_breakdown_html = ""
-    if detailed_reasons:
-        score_breakdown_html = '<div class="section"><div class="section-title">Score Breakdown:</div><table style="width: 100%; border-collapse: collapse;">'
-        for reason in detailed_reasons:
-            points = reason.get("points", 0)
-            color = "#dc2626" if points > 0 else "#16a34a"
-            score_breakdown_html += f'<tr><td style="padding: 8px;">{html.escape(reason.get("explanation", ""))}</td><td style="padding: 8px; text-align: right; color: {color};">{points}</td></tr>'
-        score_breakdown_html += '</table></div>'
-
-    # Build URL list
-    urls_html = ""
-    if result.get("urls_found"):
-        urls_list = "".join([f"<li style='margin: 5px 0; word-break: break-all;'>{html.escape(u)}</li>" for u in result["urls_found"][:10]])
-        if len(result["urls_found"]) > 10:
-            urls_list += f"<li style='color: #6b7280; font-style: italic;'>...and {len(result['urls_found']) - 10} more links</li>"
-        urls_html = f"""
-        <div class="section">
-            <div class="section-title">🔗 Links Found in Email:</div>
-            <ul style="margin: 10px 0; padding-left: 20px;">
-                {urls_list}
-            </ul>
-        </div>
-        """
-
-    # Education tip
-    tip_html = ""
-    if ENABLE_TIPS:
-        tip = get_educational_tip(result["reasons"])
-        tip_html = f'<div class="section" style="background: #eff6ff; border: 2px solid #3b82f6; padding: 15px; border-radius: 8px; font-size: 15px;">{html.escape(tip)}</div>'
-
-    # Dashboard link
-    feedback_html = f"""
-    <div class="section" style="background: #f0fdf4; border: 2px solid #22c55e; padding: 15px; border-radius: 8px;">
-        <div class="section-title" style="margin-bottom: 10px;">⚙️ Manage Your Settings:</div>
-        <div style="font-size: 14px; line-height: 1.6;">
-            Visit your dashboard to manage whitelist and blocklist:<br>
-            <a href="https://spamscore-dashboard.vercel.app" style="color: #16a34a; font-weight: bold;">spamscore-dashboard.vercel.app</a>
-        </div>
-    </div>
     """
-
-    # Build steps list
-    steps_html = "".join([f"<li style='margin: 8px 0; font-size: 15px;'>{html.escape(step)}</li>" for step in action["steps"]])
-
-    # Final HTML
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 650px; margin: 0 auto; padding: 20px; background: #f9fafb; }}
-            .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-            .header {{ text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 2px solid #e5e7eb; }}
-            .title {{ font-size: 24px; font-weight: bold; color: #111827; margin: 10px 0; }}
-            .subtitle {{ font-size: 16px; color: #6b7280; margin: 5px 0; }}
-            .verdict-badge {{ display: inline-block; padding: 8px 16px; border-radius: 6px; font-weight: bold; font-size: 14px; margin: 15px 0; }}
-            .verdict-block {{ background: #fef2f2; color: #dc2626; border: 2px solid #dc2626; }}
-            .verdict-caution {{ background: #fffbeb; color: #d97706; border: 2px solid #d97706; }}
-            .verdict-safe {{ background: #f0fdf4; color: #16a34a; border: 2px solid #16a34a; }}
-            .section {{ margin: 25px 0; padding: 20px; background: #f9fafb; border-radius: 8px; }}
-            .section-title {{ font-weight: bold; font-size: 16px; color: #374151; margin-bottom: 12px; }}
-            .email-details {{ background: #f3f4f6; padding: 15px; border-radius: 8px; margin: 15px 0; }}
-            .email-details div {{ margin: 8px 0; font-size: 14px; }}
-            .footer {{ text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 13px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <div style="font-size: 48px; margin-bottom: 10px;">{action['emoji']}</div>
-                <div class="title">{html.escape(action['title'])}</div>
-                <div class="subtitle">{html.escape(action['subtitle'])}</div>
-                <div class="verdict-badge verdict-{result['verdict']}">{result['verdict'].upper()} • Score: {result['score']}/100</div>
-            </div>
-            
-            <div class="email-details">
-                <div><strong>From:</strong> {html.escape(evaluated_sender)}</div>
-                <div><strong>Subject:</strong> {html.escape(subject or 'No subject')}</div>
-                {f'<div><strong>Original Sender:</strong> {html.escape(original_sender)}</div>' if original_sender else ''}
-            </div>
-            
-            <div class="section">
-                <div class="section-title">🎯 Recommended Actions:</div>
-                <ol style="margin: 10px 0; padding-left: 20px; line-height: 1.8;">
-                    {steps_html}
-                </ol>
-            </div>
-            
-            <div class="section">
-                <div class="section-title">🔍 Analysis Details:</div>
-                {reasons_html}
-            </div>
-            
-            {score_breakdown_html}
-            {urls_html}
-            {tip_html}
-            {feedback_html}
-            
-            <div class="footer">
-                <p><strong>SpamScore</strong> by TechAmped<br>
-                Protecting your inbox from spam and phishing</p>
-            </div>
-        </div>
-    </body>
-    </html>
+    Simplified plain-text-like HTML report for better email deliverability.
+    Minimal styling to avoid spam filters.
     """
+    if result['verdict'] == 'block':
+        icon, title = "🚫", "BLOCK - Spam"
+    elif result['verdict'] == 'caution':
+        icon, title = "⚠️", "CAUTION - Suspicious"
+    else:
+        icon, title = "✅", "SAFE - Legitimate"
+
+    display_sender = evaluated_sender
+    if evaluated_sender == UNKNOWN_SENDER_PLACEHOLDER:
+        display_sender = "Undisclosed / Hidden Sender"
+
+    # Build breakdown list (simple text)
+    breakdown_lines = ""
+    for r in result['detailed_reasons']:
+        pts = r['points']
+        sign = "+" if pts > 0 else ""
+        breakdown_lines += f"  • {html.escape(r['explanation'])}: {sign}{pts}\n"
+
+    if not breakdown_lines:
+        breakdown_lines = "  • No specific flags detected.\n"
+
+    # Build analysis list
+    analysis_lines = ""
+    if result['simple_reasons']:
+        for r in result['simple_reasons']:
+            analysis_lines += f"  • {html.escape(r['explanation'])}\n"
+    else:
+        analysis_lines = "  • Email appears safe.\n"
+
+    # Simple plain-text-like HTML (minimal styling for deliverability)
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 20px auto; padding: 20px; background: #ffffff;">
+
+<div style="text-align: center; padding: 20px 0; border-bottom: 2px solid #e0e0e0;">
+  <div style="font-size: 48px;">{icon}</div>
+  <h1 style="margin: 10px 0; font-size: 24px;">{title}</h1>
+  <p style="font-size: 18px; font-weight: bold;">Spam Score: {result['score']}/100</p>
+</div>
+
+<div style="padding: 20px 0;">
+  <p><strong>Subject:</strong> {html.escape(subject)}</p>
+  <p><strong>Sender:</strong> {html.escape(display_sender)}</p>
+  {f'<p><strong>Forwarded From:</strong> {html.escape(original_sender)}</p>' if original_sender else ''}
+</div>
+
+<div style="padding: 20px 0; border-top: 1px solid #e0e0e0;">
+  <h2 style="font-size: 16px; margin-bottom: 10px;">📊 Scoring Breakdown</h2>
+  <pre style="font-family: monospace; font-size: 13px; line-height: 1.6; background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto;">{breakdown_lines}</pre>
+</div>
+
+<div style="padding: 20px 0; border-top: 1px solid #e0e0e0;">
+  <h2 style="font-size: 16px; margin-bottom: 10px;">🛡️ Analysis</h2>
+  <pre style="font-family: monospace; font-size: 13px; line-height: 1.6; background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto;">{analysis_lines}</pre>
+</div>
+
+<div style="padding: 20px 0; border-top: 1px solid #e0e0e0; text-align: center; font-size: 12px; color: #666;">
+  <p>Analysis provided by SpamScore</p>
+  <p><a href="https://spamscore-dashboard.vercel.app" style="color: #0066cc;">Manage your settings</a></p>
+</div>
+
+</body>
+</html>"""
 
 def build_text_report(sender: str, subject: str, result: Dict, original_sender: str | None, evaluated_sender: str) -> str:
-    action = get_action_advice(result["verdict"], result["category"])
-    detailed_reasons = result.get("detailed_reasons", [])
-    
-    report = f"""
-{action['emoji']} {action['title']}
-{action['subtitle']}
+    return f"VERDICT: {result['verdict'].upper()}\nSCORE: {result['score']}\nSENDER: {evaluated_sender}\n\nSCORING BREAKDOWN:\n" + "\n".join([f"- {r['explanation']}: {r['points']}" for r in result['detailed_reasons']])
 
-VERDICT: {result['verdict'].upper()}
-SCORE: {result['score']}/100
+# ==============================================================================
+# WEBHOOK RECEIVER
+# ==============================================================================
 
-FROM: {evaluated_sender}
-SUBJECT: {subject or 'No subject'}
-{f'ORIGINAL SENDER: {original_sender}' if original_sender else ''}
-
-RECOMMENDED ACTIONS:
-"""
-    for i, step in enumerate(action["steps"], 1):
-        report += f"{i}. {step}\n"
-    
-    report += "\nSCORE BREAKDOWN:\n"
-    for reason in detailed_reasons:
-        points = reason.get("points", 0)
-        report += f"• {reason.get('explanation', '')}: {points} points\n"
-        
-    if result.get("urls_found"):
-        report += f"\nLINKS FOUND ({len(result['urls_found'])}):\n"
-        for u in result["urls_found"][:10]:
-            report += f"• {u}\n"
-        if len(result["urls_found"]) > 10:
-            report += f"...and {len(result['urls_found']) - 10} more\n"
-    
-    if ENABLE_TIPS:
-        tip = get_educational_tip(result["reasons"])
-        report += f"\n{tip}\n"
-    
-    report += """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚙️ MANAGE SETTINGS
-Visit your dashboard to manage whitelist and blocklist:
-https://spamscore-dashboard.vercel.app
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SpamScore by TechAmped
-Protecting your inbox from spam and phishing
-"""
-    
-    return report
-
-# ========= Root Route =========
-@app.get("/")
-async def root():
-    return {
-        "status": "ok",
-        "service": "SpamScore Backend",
-        "version": "2.5-tightened-full",
-        "git_sha": GIT_SHA[:8] if GIT_SHA else "unknown",
-        "build_time": BUILD_TIME,
-        "endpoints": {
-            "scan": "POST /receive (Mailgun webhook for email forwarding)",
-            "whitelist": "GET/POST /api/whitelist/*",
-            "blocklist": "GET/POST /api/blocklist/*",
-            "history": "GET /api/history",
-            "analytics": "GET /api/stats/summary"
-        }
-    }
-
-# ========= Email Receive Endpoint (IMPROVED LOGIC) =========
 @app.post("/receive")
-async def receive_mailgun_webhook(
-    sender: str = Form(...),
-    recipient: str = Form(...),
-    subject: str = Form(""),
-    body_plain: str = Form(""),
-    body_html: str = Form(""),
-    stripped_text: str = Form("")
-):
+async def receive_mailgun_webhook(request: Request):
     """
     Main webhook for receiving emails from Mailgun
+    Fixed to properly capture body fields with multiple name variations
     """
-    # Extract user email from the forwarder
+    # Get ALL form data
+    form_data = await request.form()
+    form_dict = dict(form_data)
+
+    # Extract required fields with fallbacks
+    sender = form_dict.get("sender") or form_dict.get("from") or form_dict.get("From") or ""
+    recipient = form_dict.get("recipient") or form_dict.get("to") or form_dict.get("To") or ""
+    subject = form_dict.get("subject") or form_dict.get("Subject") or ""
+
+    # Try ALL possible body field name variations (Mailgun uses hyphens!)
+    body_plain = (
+        form_dict.get("body-plain") or    # Mailgun sends THIS
+        form_dict.get("body_plain") or
+        form_dict.get("bodyPlain") or
+        form_dict.get("body") or
+        form_dict.get("text") or
+        ""
+    )
+
+    body_html = (
+        form_dict.get("body-html") or     # Mailgun sends THIS
+        form_dict.get("body_html") or
+        form_dict.get("bodyHtml") or
+        form_dict.get("html") or
+        ""
+    )
+
+    stripped_text = (
+        form_dict.get("stripped-text") or  # Mailgun sends THIS
+        form_dict.get("stripped_text") or
+        form_dict.get("strippedText") or
+        ""
+    )
+
+    # Auth headers (try both formats)
+    X_Mailgun_Spf = form_dict.get("X-Mailgun-Spf") or form_dict.get("X_Mailgun_Spf") or ""
+    X_Mailgun_Dkim_Check_Result = form_dict.get("X-Mailgun-Dkim-Check-Result") or form_dict.get("X_Mailgun_Dkim_Check_Result") or ""
+    dmarc = form_dict.get("dmarc") or form_dict.get("DMARC") or ""
+    From = form_dict.get("From") or form_dict.get("from") or sender
+
+    # Storage URLs
+    message_url = form_dict.get("message-url") or form_dict.get("message_url") or ""
+    storage_url = form_dict.get("storage-url") or form_dict.get("storage_url") or ""
+
     user_email = sender.lower().strip()
     user_id = get_user_id_from_email(user_email)
-    
-    # CRITICAL FIX: Use FULL body content for forwarded emails (stripped_text removes original content!)
-    body_for_detection = body_plain or body_html or stripped_text
 
-    # Prioritize HTML for Content Scanning (hidden links/pixels)
-    body_for_scanning = body_html or body_plain or stripped_text
+    # FIX: Use body_html for detection when body_plain is empty
+    # stripped_text removes forwarded headers, so skip it for detection
+    body_struct = body_plain or body_html or stripped_text
+    body_content = body_html or body_plain or stripped_text
     
-    print(f"\n{'='*60}")
-    print(f"📧 RECEIVED EMAIL FROM: {sender}")
-    print(f"📋 SUBJECT: {subject}")
-    
-    # Try to detect original sender in forwarded email
-    original_sender = detect_forwarded_original_sender(body_for_detection) if FORWARDED_PREFER_ORIGINAL else None
-    
-    # Heuristic fallback
-    is_forwarded_structure = "forwarded message" in body_for_detection.lower() or "from:" in body_for_detection.lower()[:1000]
-    
+    # DEBUG: Log ALL form parameters Mailgun is sending
+    all_keys = list(form_dict.keys())
+    print(f"   DEBUG: ALL Mailgun parameters received: {all_keys}")
+    print(f"   DEBUG: message_url=[{message_url}], storage_url=[{storage_url}]")
+
+    print(f"Processing: {sender} | {subject}")
+    print(f"   DEBUG: Auth headers - SPF=[{X_Mailgun_Spf}], DKIM=[{X_Mailgun_Dkim_Check_Result}], DMARC=[{dmarc}], From=[{From}]")
+
+    # DEBUG: Log body structure for forwarded email debugging
+    if "fwd" in subject.lower() or "fw:" in subject.lower():
+        print(f"   DEBUG: Forward detected in subject")
+        print(f"   DEBUG: body_plain length: {len(body_plain) if body_plain else 0}")
+        print(f"   DEBUG: body_html length: {len(body_html) if body_html else 0}")
+        print(f"   DEBUG: stripped_text length: {len(stripped_text) if stripped_text else 0}")
+        print(f"   DEBUG: body_struct source: {'body_plain' if body_plain else ('body_html' if body_html else 'stripped_text')}")
+        print(f"   DEBUG: body_struct first 500 chars:\n{body_struct[:500]}")
+
+    # 1. Detect Original Sender
+    original_sender_result = detect_forwarded_original_sender(body_struct)
+    original_sender = original_sender_result[0] if original_sender_result else None
+    original_display_name = original_sender_result[1] if original_sender_result else ""
+
+    # 2. Check if Forward
+    is_forward = re.search(r'^(fwd?|fw):', subject, re.I) or "forwarded message" in body_struct.lower()
+
+    # 3. Evaluation Logic
     if original_sender:
-        evaluated_sender = original_sender
-        analysis_user_id = None 
-        print(f"   ✅ Extracted Original Sender: {evaluated_sender}")
+        eval_sender = original_sender
+        use_uid = None
+        force_neutral = True
+        print(f"   -> Found Original Sender: {eval_sender} (Display: {original_display_name})")
         
-    elif is_forwarded_structure and FORWARDED_PREFER_ORIGINAL:
-        # We see it's a forward, but regex failed. 
-        evaluated_sender = "unknown_potential_spam@unknown.com"
-        analysis_user_id = None
-        print(f"   ⚠️ Detected forward structure but couldn't parse sender. Disabling whitelist.")
+    elif is_forward:
+        # Fallback: Forwarded but no sender found
+        eval_sender = UNKNOWN_SENDER_PLACEHOLDER
+        use_uid = None
+        force_neutral = True
+        print("   -> Forward detected, sender unknown. Using Strict Mode.")
         
     else:
-        # Direct email
-        evaluated_sender = sender
-        analysis_user_id = user_id
-        print(f"   👤 Direct email from: {evaluated_sender}")
-    
-    # Generate unique scan ID
-    scan_id = hashlib.sha256(f"{user_id}{evaluated_sender}{subject}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
-    
-    # Analyze
-    # Pass body_for_scanning (HTML included) so we detect hidden links/pixels
-    result = await categorize_email(evaluated_sender, subject, body_for_scanning, user_id=analysis_user_id)
-    
-    print(f"   📊 Final Score: {result['score']} ({result['verdict']})")
-    
-    # Record scan history with all proper fields
-    record_scan(
-        user_id=user_id,
-        scan_id=scan_id,
-        sender=evaluated_sender,
-        subject=subject or "No subject",
-        score=result["score"],
-        verdict=result["verdict"],
-        category=result["category"],
-        whitelisted=result.get("whitelisted", False),
-        blocked=result.get("blocked", False)
-    )
-    
-    # Check rate limit
-    scan_count = get_monthly_scan_count(user_id)
-    if scan_count > 100:
-        result["note"] = "Monthly limit exceeded."
-    
-    # Build reports
-    html_report = build_html_report(sender, subject, result, original_sender, evaluated_sender)
-    text_report = build_text_report(sender, subject, result, original_sender, evaluated_sender)
-    
-    action = get_action_advice(result["verdict"], result["category"])
-    title = f"{action['emoji']} SpamScore: {action['title'][:50]}"
-    
-    # Send report back to the forwarder
-    ok, st, txt = await send_report_via_mailgun(sender, title, html_report, text_report)
-    
-    return {
-        "status": "ok" if ok else "mail_send_failed",
-        "type": "scan",
-        "verdict": result["verdict"],
-        "category": result["category"],
-        "emailed": ok,
-        "mailgun_status": st,
-        "evaluated_sender": evaluated_sender,
-        "score": result["score"]
+        # Direct Scan
+        eval_sender = sender
+        use_uid = user_id
+        force_neutral = False
+        print(f"   -> Direct Scan: {eval_sender}")
+        
+    # 4. Extract URLs and check whitelist for V3 scoring
+    try:
+        urls = extract_urls(body_content) if body_content else []
+    except Exception as e:
+        print(f"   ERROR: Failed to extract URLs: {e}")
+        urls = []
+
+    # Check if sender is whitelisted
+    is_whitelisted = False
+    try:
+        if use_uid:
+            sender_dom = eval_sender.split('@')[-1] if '@' in eval_sender else ""
+            wl_emails = redis_client.smembers(f"user:{use_uid}:whitelist:email") if redis_client else set()
+            wl_domains = redis_client.smembers(f"user:{use_uid}:whitelist:domain") if redis_client else set()
+            is_whitelisted = (eval_sender.encode() in wl_emails or
+                             sender_dom.encode() in wl_domains)
+    except Exception as e:
+        print(f"   ERROR: Failed to check whitelist: {e}")
+        is_whitelisted = False
+
+    # 5. Run V3 Analysis (reputation-based 3-layer scoring)
+    print(f"   -> Running V3 scoring with {len(urls)} URLs, SPF={X_Mailgun_Spf}, DKIM={X_Mailgun_Dkim_Check_Result}, DMARC={dmarc}")
+    try:
+        result = await score_email_v3(
+            sender=eval_sender,
+            subject=subject,
+            body=body_content or "",
+            urls=urls,
+            spf_result=X_Mailgun_Spf,
+            dkim_result=X_Mailgun_Dkim_Check_Result,
+            dmarc_result=dmarc,
+            is_whitelisted=is_whitelisted,
+            recipient=recipient,
+            display_name=original_display_name
+        )
+        print(f"   -> V3 Score: {result['score']}/100, Verdict: {result['verdict']}, Reasons: {len(result.get('reasons', []))}")
+    except Exception as e:
+        print(f"   ERROR: V3 scoring failed: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to safe verdict with minimal score
+        result = {
+            "score": 5,
+            "verdict": "safe",
+            "category": "unknown",
+            "reasons": [("scoring_error", 5)]
+        }
+
+    # Add legacy fields for compatibility with report generation
+    result["whitelisted"] = is_whitelisted
+    result["blocklisted"] = False
+
+    # Convert v3 reasons format to legacy format for report generation
+    # V3 format: [("spamhaus_dbl_listed", 70), ("spf_pass", -8)]
+    # Legacy format: [{"explanation": "Spamhaus DBL Listed", "points": 70}]
+    reason_labels = {
+        "spamhaus_dbl_listed": "Spamhaus DBL Listed",
+        "urlhaus_malicious": "URLhaus Malicious URL",
+        "safe_browsing_malicious": "Google Safe Browsing Malicious",
+        "dmarc_spf_fail": "DMARC + SPF Authentication Failure",
+        "dkim_fail_new_domain": "DKIM Failure (New Domain)",
+        "spf_pass": "SPF Authentication Pass",
+        "dkim_pass": "DKIM Authentication Pass",
+        "dmarc_pass": "DMARC Authentication Pass",
+        "clean_bill_of_health": "Clean Reputation (All Checks Pass)",
+        "whitelisted_sender": "Whitelisted Sender",
+        "internal_email": "Internal Email (Same Domain)",
+        "unsubscribe_link": "Unsubscribe Link Detected (Marketing)",
+        "view_in_browser": "View in Browser Link (Marketing)",
+        "tracking_urls": "Tracking URLs Detected (Marketing)",
+        "marketing_language": "Marketing Language Detected",
+        "urgency_language": "Urgency Language Detected",
+        "excessive_links": "Excessive Links (20+)",
+        "many_links": "Many Links (10+)",
+        "high_link_density": "High Link Density (5+)",
+        "url_shortener": "URL Shortener Detected",
+        "suspicious_tld": "Suspicious Domain Extension (Phishing)",
+        "scam_language": "Prize/Scam Language Detected",
+        "survey_scam": "Survey Scam Pattern Detected",
+        "romance_scam": "Romance/Dating Scam Pattern Detected",
+        "text_obfuscation": "Hidden Text Obfuscation Detected",
+        "display_name_mismatch": "Display Name Domain Mismatch (Phishing)",
+        "gibberish_sender": "Gibberish Sender Address (Scam)"
     }
 
+    result["detailed_reasons"] = [
+        {"explanation": reason_labels.get(key, key.replace("_", " ").title()),
+         "points": points}
+        for key, points in result.get("reasons", [])
+    ]
 
-# ========= Dashboard API Models =========
-class WhitelistAddRequest(BaseModel):
-    user_email: str
-    type: str  # 'email' or 'domain'
-    value: str
+    # Add simple_reasons for legacy compatibility (with severity for report)
+    result["simple_reasons"] = [
+        {
+            "explanation": reason_labels.get(key, key.replace("_", " ").title()),
+            "severity": "high" if points >= 30 else "medium"
+        }
+        for key, points in result.get("reasons", [])
+        if points > 0  # Only include positive contributions
+    ]
+    
+    # 5. Record & Report
+    scan_id = hashlib.sha256(f"{user_id}{eval_sender}{subject}{datetime.now()}".encode()).hexdigest()[:16]
+    
+    record_scan(
+        user_id, scan_id, eval_sender, subject, 
+        result["score"], result["verdict"], result["category"], 
+        result["whitelisted"], False
+    )
+    
+    html_report = build_html_report(sender, subject, result, original_sender, eval_sender)
+    text_report = build_text_report(sender, subject, result, original_sender, eval_sender)
+    
+    title_emoji = "🚫" if result['verdict'] == 'block' else "⚠️" if result['verdict'] == 'caution' else "✅"
+    title = f"{title_emoji} SpamScore: {result['verdict'].upper()} ({result['score']}/100)"
+    
+    await send_report_via_mailgun(sender, title, html_report, text_report)
+    
+    return {"status": "ok", "verdict": result["verdict"], "score": result["score"]}
 
-class WhitelistRemoveRequest(BaseModel):
-    user_email: str
-    type: str
-    value: str
+async def send_report_via_mailgun(to, subj, html, text):
+    if not (MG_KEY and MG_DOMAIN): return
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"https://api.mailgun.net/v3/{MG_DOMAIN}/messages",
+            auth=("api", MG_KEY),
+            data={"from": REPLY_FROM, "to": to, "subject": subj, "html": html, "text": text}
+        )
 
-class BlocklistAddRequest(BaseModel):
-    user_email: str
-    type: str  # 'email' or 'domain'
-    value: str
+# ==============================================================================
+# DASHBOARD API ENDPOINTS
+# ==============================================================================
 
-class BlocklistRemoveRequest(BaseModel):
-    user_email: str
-    type: str
-    value: str
-
-def get_user_id(email: str) -> str:
-    """Generate user ID from email (for dashboard API)"""
-    return hashlib.sha256(email.lower().encode()).hexdigest()[:16]
-
-def validate_email_format(email: str) -> bool:
-    """Validate email address format"""
-    if not email or len(email) > 254:
-        return False
-    # Basic email validation regex
-    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
-    return bool(email_pattern.match(email))
-
-def validate_domain_format(domain: str) -> bool:
-    """Validate domain format"""
-    if not domain or len(domain) > 253:
-        return False
-    # Domain should not contain @ symbol and should have at least one dot
-    if '@' in domain:
-        return False
-    # Basic domain validation
-    domain_pattern = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$')
-    return bool(domain_pattern.match(domain))
-
-# ========= Whitelist API Endpoints =========
 @app.get("/api/whitelist/list")
 async def api_get_whitelist(user_email: str):
-    """Get user's whitelist"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    user_id = get_user_id(user_email)
-    
-    # Get emails and domains from whitelist
-    email_whitelist = get_whitelist(user_id, 'email')
-    domain_whitelist = get_whitelist(user_id, 'domain')
-    
-    # Format response with metadata
-    whitelist = []
-    
-    for email in email_whitelist:
-        meta_key = f"whitelist:{user_id}:email:meta:{email}"
-        meta = redis_client.hgetall(meta_key)
-        whitelist.append({
-            "type": "email",
-            "value": email,
-            "added_at": meta.get("added_at", datetime.now().isoformat())
-        })
-    
-    for domain in domain_whitelist:
-        meta_key = f"whitelist:{user_id}:domain:meta:{domain}"
-        meta = redis_client.hgetall(meta_key)
-        whitelist.append({
-            "type": "domain",
-            "value": domain,
-            "added_at": meta.get("added_at", datetime.now().isoformat())
-        })
-    
-    return {"whitelist": whitelist}
+    if not redis_client: raise HTTPException(503, "DB Error")
+    user_id = get_user_id_from_email(user_email)
+    wl = []
+    for t in ['email', 'domain']:
+        for v in get_whitelist(user_id, t):
+            meta = redis_client.hgetall(f"whitelist:{user_id}:{t}:meta:{v}")
+            wl.append({"type": t, "value": v, "added_at": meta.get("added_at", "")})
+    return {"whitelist": wl}
 
 @app.post("/api/whitelist/add")
-async def api_add_to_whitelist(request: WhitelistAddRequest):
-    """Add email or domain to whitelist"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    # Validate user email
-    if not validate_email_format(request.user_email):
-        raise HTTPException(status_code=400, detail="Invalid user email format")
-
-    user_id = get_user_id(request.user_email)
-
-    # Validate type
-    if request.type not in ["email", "domain", "sender_name"]:
-        raise HTTPException(status_code=400, detail="Type must be 'email', 'domain', or 'sender_name'")
-
-    # Validate value based on type
-    if request.type == "email":
-        if not validate_email_format(request.value):
-            raise HTTPException(status_code=400, detail=f"Invalid email format: {request.value}")
-    elif request.type == "domain":
-        if not validate_domain_format(request.value):
-            raise HTTPException(status_code=400, detail=f"Invalid domain format: {request.value}")
-    elif request.type == "sender_name":
-        if not request.value or len(request.value) > 100:
-            raise HTTPException(status_code=400, detail="Sender name must be between 1 and 100 characters")
-
-    success = add_to_whitelist(user_id, request.value, request.type)
-
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to add to whitelist")
-
-    return {"success": True, "message": f"Added {request.value} to whitelist"}
+async def api_add_to_whitelist(req: WhitelistAddRequest):
+    if not redis_client: raise HTTPException(503, "DB Error")
+    uid = get_user_id_from_email(req.user_email)
+    add_to_whitelist(uid, req.value, req.type)
+    return {"success": True}
 
 @app.post("/api/whitelist/remove")
-async def api_remove_from_whitelist(request: WhitelistRemoveRequest):
-    """Remove email or domain from whitelist"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
+async def api_rem_from_whitelist(req: WhitelistRemoveRequest):
+    if not redis_client: raise HTTPException(503, "DB Error")
+    uid = get_user_id_from_email(req.user_email)
+    remove_from_whitelist(uid, req.value, req.type)
+    return {"success": True}
 
-    # Validate user email
-    if not validate_email_format(request.user_email):
-        raise HTTPException(status_code=400, detail="Invalid user email format")
-
-    user_id = get_user_id(request.user_email)
-
-    # Validate type
-    if request.type not in ["email", "domain", "sender_name"]:
-        raise HTTPException(status_code=400, detail="Type must be 'email', 'domain', or 'sender_name'")
-
-    success = remove_from_whitelist(user_id, request.value, request.type)
-
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to remove from whitelist")
-
-    return {"success": True, "message": f"Removed {request.value} from whitelist"}
-
-# ========= Blocklist API Endpoints =========
 @app.get("/api/blocklist/list")
 async def api_get_blocklist(user_email: str):
-    """Get user's blocklist"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    # Validate user email
-    if not validate_email_format(user_email):
-        raise HTTPException(status_code=400, detail="Invalid user email format")
-
-    user_id = get_user_id(user_email)
-
-    # Get emails and domains from blocklist
-    email_blocklist = redis_client.smembers(f"blocklist:{user_id}:email") if redis_client else set()
-    domain_blocklist = redis_client.smembers(f"blocklist:{user_id}:domain") if redis_client else set()
-
-    # Format response with metadata
-    blocklist = []
-
-    for email in email_blocklist:
-        meta_key = f"blocklist:{user_id}:email:meta:{email}"
-        meta = redis_client.hgetall(meta_key) if redis_client else {}
-        blocklist.append({
-            "type": "email",
-            "value": email,
-            "added_at": meta.get("added_at", datetime.now().isoformat())
-        })
-
-    for domain in domain_blocklist:
-        meta_key = f"blocklist:{user_id}:domain:meta:{domain}"
-        meta = redis_client.hgetall(meta_key) if redis_client else {}
-        blocklist.append({
-            "type": "domain",
-            "value": domain,
-            "added_at": meta.get("added_at", datetime.now().isoformat())
-        })
-
-    return {"blocklist": blocklist}
+    if not redis_client: raise HTTPException(503, "DB Error")
+    user_id = get_user_id_from_email(user_email)
+    bl = []
+    for t in ['email', 'domain']:
+        for v in redis_client.smembers(get_blocklist_key(user_id, t)):
+            meta = redis_client.hgetall(f"blocklist:{user_id}:{t}:meta:{v}")
+            bl.append({"type": t, "value": v, "added_at": meta.get("added_at", "")})
+    return {"blocklist": bl}
 
 @app.post("/api/blocklist/add")
-async def api_add_to_blocklist(request: BlocklistAddRequest):
-    """Add email or domain to blocklist"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    # Validate user email
-    if not validate_email_format(request.user_email):
-        raise HTTPException(status_code=400, detail="Invalid user email format")
-
-    user_id = get_user_id(request.user_email)
-
-    # Validate type
-    if request.type not in ["email", "domain"]:
-        raise HTTPException(status_code=400, detail="Type must be 'email' or 'domain'")
-
-    # Validate value based on type
-    if request.type == "email":
-        if not validate_email_format(request.value):
-            raise HTTPException(status_code=400, detail=f"Invalid email format: {request.value}")
-    elif request.type == "domain":
-        if not validate_domain_format(request.value):
-            raise HTTPException(status_code=400, detail=f"Invalid domain format: {request.value}")
-
-    # Check if already whitelisted - if so, remove from whitelist first
-    user_id_check = get_user_id(request.user_email)
-    if is_whitelisted(user_id_check, request.value, request.type):
-        remove_from_whitelist(user_id_check, request.value, request.type)
-
-    success = add_to_blocklist(user_id, request.value, request.type)
-
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to add to blocklist")
-
-    return {"success": True, "message": f"Added {request.value} to blocklist"}
+async def api_add_to_blocklist(req: BlocklistAddRequest):
+    if not redis_client: raise HTTPException(503, "DB Error")
+    uid = get_user_id_from_email(req.user_email)
+    if is_whitelisted(uid, req.value, req.type): 
+        remove_from_whitelist(uid, req.value, req.type)
+    add_to_blocklist(uid, req.value, req.type)
+    return {"success": True}
 
 @app.post("/api/blocklist/remove")
-async def api_remove_from_blocklist(request: BlocklistRemoveRequest):
-    """Remove email or domain from blocklist"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
+async def api_rem_from_blocklist(req: BlocklistRemoveRequest):
+    if not redis_client: raise HTTPException(503, "DB Error")
+    uid = get_user_id_from_email(req.user_email)
+    remove_from_blocklist(uid, req.value, req.type)
+    return {"success": True}
 
-    # Validate user email
-    if not validate_email_format(request.user_email):
-        raise HTTPException(status_code=400, detail="Invalid user email format")
-
-    user_id = get_user_id(request.user_email)
-
-    # Validate type
-    if request.type not in ["email", "domain"]:
-        raise HTTPException(status_code=400, detail="Type must be 'email' or 'domain'")
-
-    success = remove_from_blocklist(user_id, request.value, request.type)
-
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to remove from blocklist")
-
-    return {"success": True, "message": f"Removed {request.value} from blocklist"}
-
-# ========= History API Endpoint =========
 @app.get("/api/history")
-async def api_get_scan_history(user_email: str, limit: int = 50):
-    """Get user's scan history"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    user_id = get_user_id(user_email)
-    history = get_scan_history(user_id, limit)
-    
-    return {"history": history}
+async def api_get_history_endpoint(user_email: str, limit: int = 50):
+    if not redis_client: raise HTTPException(503, "DB Error")
+    return {"history": get_scan_history(get_user_id_from_email(user_email), limit)}
 
-# ========= Analytics/Stats API Endpoint =========
 @app.get("/api/stats/summary")
 async def api_get_stats_summary(user_email: str):
-    """Get user's stats summary"""
-    if not redis_client:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    user_id = get_user_id(user_email)
-    
-    # Get scan count for current month
-    monthly_usage = get_monthly_scan_count(user_id)
-    
-    # Get feedback stats
-    false_positives = int(redis_client.get(f"stats:{user_id}:false_positives") or 0)
-    false_negatives = int(redis_client.get(f"stats:{user_id}:false_negatives") or 0)
-    
-    # Get whitelist and blocklist counts
-    email_wl_count = redis_client.scard(f"whitelist:{user_id}:email") or 0
-    domain_wl_count = redis_client.scard(f"whitelist:{user_id}:domain") or 0
-    whitelisted_senders = email_wl_count + domain_wl_count
-    
-    blocked_senders = get_blocklist_count(user_id)
-    
-    # Calculate accuracy estimate
-    total_feedback = false_positives + false_negatives
-    if monthly_usage > 0:
-        false_positive_rate = (false_positives / monthly_usage * 100)
-        false_negative_rate = (false_negatives / monthly_usage * 100)
-        accuracy = 100 - (false_positive_rate + false_negative_rate)
-    else:
-        accuracy = 95.0  # Default estimate
-    
-    # Generate whitelist help text
-    if whitelisted_senders == 0:
-        whitelist_help_text = "Add trusted senders to reduce false positives"
-    elif whitelisted_senders < 5:
-        whitelist_help_text = f"Your {whitelisted_senders} trusted sender(s) help prevent false alarms"
-    else:
-        reduction_estimate = min(75, whitelisted_senders * 5)
-        whitelist_help_text = f"Your whitelist has reduced false positives by ~{reduction_estimate}%"
-    
+    if not redis_client: raise HTTPException(503, "DB Error")
+    uid = get_user_id_from_email(user_email)
     return {
-        "monthly_usage": monthly_usage,
-        "monthly_limit": 100,
-        "overall_accuracy": round(accuracy, 1),
-        "false_positives": false_positives,
-        "false_negatives": false_negatives,
-        "whitelisted_senders": whitelisted_senders,
-        "blocked_senders": blocked_senders,
-        "whitelist_help_text": whitelist_help_text
+        "monthly_usage": get_monthly_scan_count(uid),
+        "monthly_limit": 100
     }
